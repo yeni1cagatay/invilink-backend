@@ -103,7 +103,12 @@ class StegaStamp:
             self.output_stegastamp,
             feed_dict={self.input_secret: [bits], self.input_image: [img_np]},
         )
-        return Image.fromarray((result[0] * 255).astype(np.uint8))
+        out = result[0]
+        # Model residual ciktisi veriyorsa (deger 0 etrafinda) orijinal gorselle topla
+        if out.min() < -0.01:
+            out = img_np + out
+        out = np.clip(out, 0, 1)
+        return Image.fromarray((out * 255).astype(np.uint8))
 
     def decode(self, image: Image.Image) -> Optional[str]:
         img_np = self._prepare(image)
