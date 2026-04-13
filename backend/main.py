@@ -14,7 +14,7 @@ from stega import StegaStamp
 
 stega: Optional[StegaStamp] = None
 
-app = FastAPI(title="InviLink API", version="1.0.0")
+app = FastAPI(title="Brandion API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,

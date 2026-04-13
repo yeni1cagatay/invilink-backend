@@ -1,0 +1,30 @@
+{
+  "expo": {
+    "name": "Brandion",
+    "slug": "brandion",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "backgroundColor": "#0a0a0a"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.brandion.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Ekrandaki görünmez filigranı okumak için kamera gereklidir."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#0a0a0a"
+      },
+      "package": "com.brandion.app",
+      "permissions": ["CAMERA"]
+    },
+    "plugins": [
+      ["expo-camera", { "cameraPermission": "Ekrandaki görünmez filigranı okumak için kamera gereklidir." }]
+    ]
+  }
+}
