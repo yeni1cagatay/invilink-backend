@@ -67,6 +67,9 @@ class StegaStamp:
             self.output_stegastamp = self.sess.graph.get_tensor_by_name(
                 sig.outputs["stegastamp"].name
             )
+            self.output_residual = self.sess.graph.get_tensor_by_name(
+                sig.outputs["residual"].name
+            )
             self.output_decoded = self.sess.graph.get_tensor_by_name(
                 sig.outputs["decoded"].name
             )
@@ -105,22 +108,18 @@ class StegaStamp:
         bits += [0] * (SECRET_SIZE - len(bits))
 
         img_np = self._prepare_01(image)
-        print(f"[STEGA] img mean={img_np.mean():.4f}")
 
-        result = self.sess.run(
-            self.output_stegastamp,
+        stegastamp, residual = self.sess.run(
+            [self.output_stegastamp, self.output_residual],
             feed_dict={self.input_secret: [bits], self.input_image: [img_np]},
         )
-        out = result[0]
-        print(f"[STEGA] out min={out.min():.4f} max={out.max():.4f} mean={out.mean():.4f} std={out.std():.4f}")
+        res = residual[0]
+        print(f"[STEGA] residual min={res.min():.4f} max={res.max():.4f} mean={res.mean():.4f} std={res.std():.4f}")
 
-        # Goruntu [0,1] araliginda ve input mean'e yakinsa dogrudan kullan
-        # Aksi halde input'u geri ekle (residual ciktisi)
-        if abs(out.mean() - img_np.mean()) > 0.15:
-            print("[STEGA] large deviation detected, treating as residual")
-            out = img_np + out
-
-        out = np.clip(out, 0, 1)
+        # Orijinal gorsel + cok kucuk perturbation = gorunmez filigran
+        out = np.clip(img_np + res, 0, 1)
+        diff = np.abs(res).mean()
+        print(f"[STEGA] pixel diff mean={diff:.4f}")
         return Image.fromarray((out * 255).astype(np.uint8))
 
     def decode(self, image: Image.Image) -> Optional[str]:
