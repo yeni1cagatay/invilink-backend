@@ -104,8 +104,10 @@ class StegaStamp:
             feed_dict={self.input_secret: [bits], self.input_image: [img_np]},
         )
         out = result[0]
-        # Model residual ciktisi veriyorsa (deger 0 etrafinda) orijinal gorselle topla
-        if out.min() < -0.01:
+        print(f"[STEGA] out min={out.min():.4f} max={out.max():.4f} mean={out.mean():.4f} std={out.std():.4f}")
+        # Residual ciktisi: mean ~0, std yuksek → orijinal gorsele ekle
+        if abs(out.mean()) < 0.2 and out.std() > 0.05:
+            print("[STEGA] residual detected, adding to original")
             out = img_np + out
         out = np.clip(out, 0, 1)
         return Image.fromarray((out * 255).astype(np.uint8))
