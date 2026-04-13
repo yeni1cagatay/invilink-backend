@@ -87,10 +87,14 @@ class StegaStamp:
                     continue
         return self._bch
 
-    def _prepare(self, image: Image.Image) -> np.ndarray:
+    def _prepare_01(self, image: Image.Image) -> np.ndarray:
+        """[0,1] normalizasyon"""
         image = image.convert("RGB")
         image = ImageOps.fit(image, (IMAGE_SIZE, IMAGE_SIZE))
         return np.array(image, dtype=np.float32) / 255.0
+
+    def _prepare(self, image: Image.Image) -> np.ndarray:
+        return self._prepare_01(image)
 
     def encode(self, image: Image.Image, code: str) -> Image.Image:
         code = (code[:7] + " " * 7)[:7]
@@ -100,18 +104,22 @@ class StegaStamp:
         bits = [int(b) for byte in packet for b in format(byte, "08b")]
         bits += [0] * (SECRET_SIZE - len(bits))
 
-        img_np = self._prepare(image)
+        img_np = self._prepare_01(image)
+        print(f"[STEGA] img mean={img_np.mean():.4f}")
+
         result = self.sess.run(
             self.output_stegastamp,
             feed_dict={self.input_secret: [bits], self.input_image: [img_np]},
         )
         out = result[0]
-        print(f"[STEGA] img shape={img_np.shape} mean={img_np.mean():.4f}")
-        print(f"[STEGA] out shape={out.shape} min={out.min():.4f} max={out.max():.4f} mean={out.mean():.4f} std={out.std():.4f}")
-        # Residual ciktisi: mean ~0, std yuksek → orijinal gorsele ekle
-        if abs(out.mean()) < 0.2 and out.std() > 0.05:
-            print("[STEGA] residual detected, adding to original")
+        print(f"[STEGA] out min={out.min():.4f} max={out.max():.4f} mean={out.mean():.4f} std={out.std():.4f}")
+
+        # Goruntu [0,1] araliginda ve input mean'e yakinsa dogrudan kullan
+        # Aksi halde input'u geri ekle (residual ciktisi)
+        if abs(out.mean() - img_np.mean()) > 0.15:
+            print("[STEGA] large deviation detected, treating as residual")
             out = img_np + out
+
         out = np.clip(out, 0, 1)
         return Image.fromarray((out * 255).astype(np.uint8))
 
