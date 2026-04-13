@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>InviLink — Görünmez Bağlantı</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0a0a0a; color: #f0f0f0; min-height: 100vh;
+      display: flex; flex-direction: column; align-items: center;
+    }
+    header {
+      width: 100%; padding: 24px 40px;
+      border-bottom: 1px solid #1f1f1f;
+      display: flex; align-items: center; gap: 12px;
+    }
+    .logo { font-size: 22px; font-weight: 700; letter-spacing: -0.5px; }
+    .logo span { color: #7c6af5; }
+    .badge {
+      background: #1a1a2e; color: #7c6af5; font-size: 11px;
+      padding: 3px 10px; border-radius: 20px; border: 1px solid #3a3060;
+    }
+    main { width: 100%; max-width: 640px; padding: 48px 24px; }
+    h1 { font-size: 32px; font-weight: 700; margin-bottom: 8px; }
+    h1 span { color: #7c6af5; }
+    .subtitle { color: #888; margin-bottom: 40px; font-size: 15px; }
+
+    .card {
+      background: #111; border: 1px solid #222; border-radius: 16px;
+      padding: 32px; margin-bottom: 24px;
+    }
+    .card h2 { font-size: 16px; font-weight: 600; margin-bottom: 20px; color: #ccc; }
+
+    .drop-zone {
+      border: 2px dashed #333; border-radius: 12px; padding: 40px;
+      text-align: center; cursor: pointer; transition: all 0.2s;
+      margin-bottom: 16px; position: relative;
+    }
+    .drop-zone:hover, .drop-zone.dragover { border-color: #7c6af5; background: #13102a; }
+    .drop-zone input[type="file"] {
+      position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+    }
+    .drop-icon { font-size: 32px; margin-bottom: 8px; }
+    .drop-label { color: #888; font-size: 14px; }
+    .drop-label strong { color: #7c6af5; }
+    #preview-wrap { display: none; margin-bottom: 16px; }
+    #preview { width: 100%; max-height: 200px; object-fit: contain;
+                border-radius: 8px; border: 1px solid #333; }
+
+    label { display: block; font-size: 13px; color: #888; margin-bottom: 6px; }
+    input[type="url"] {
+      width: 100%; background: #0d0d0d; border: 1px solid #2a2a2a;
+      border-radius: 10px; padding: 12px 16px; color: #f0f0f0;
+      font-size: 14px; outline: none; transition: border-color 0.2s;
+    }
+    input[type="url"]:focus { border-color: #7c6af5; }
+    input[type="url"]::placeholder { color: #444; }
+
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+      background: #7c6af5; color: #fff; border: none; border-radius: 10px;
+      padding: 14px 28px; font-size: 15px; font-weight: 600;
+      cursor: pointer; width: 100%; margin-top: 20px; transition: opacity 0.2s;
+    }
+    .btn:hover:not(:disabled) { opacity: 0.85; }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .spinner {
+      width: 18px; height: 18px; border: 2px solid rgba(255,255,255,0.3);
+      border-top-color: #fff; border-radius: 50%; animation: spin 0.7s linear infinite;
+      display: none;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .result { display: none; }
+    .result-inner {
+      background: #0d1a0d; border: 1px solid #1a3a1a; border-radius: 12px; padding: 20px;
+    }
+    .result-title { color: #4caf50; font-weight: 600; margin-bottom: 12px; }
+    .code-badge {
+      display: inline-block; background: #1a1a2e; color: #7c6af5;
+      font-family: monospace; font-size: 22px; font-weight: 700;
+      padding: 8px 20px; border-radius: 8px; letter-spacing: 3px;
+      border: 1px solid #3a3060; margin-bottom: 12px;
+    }
+    .result-info { color: #888; font-size: 13px; margin-bottom: 16px; }
+    .download-btn {
+      display: inline-flex; align-items: center; gap: 8px;
+      background: #1a3a1a; color: #4caf50; border: 1px solid #2a5a2a;
+      border-radius: 8px; padding: 10px 20px; font-size: 14px;
+      font-weight: 600; cursor: pointer; text-decoration: none;
+    }
+    .error {
+      background: #1a0d0d; border: 1px solid #3a1a1a;
+      border-radius: 12px; padding: 16px; color: #f44336;
+      font-size: 14px; display: none; margin-top: 16px;
+    }
+
+    .how {
+      display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-top: 8px;
+    }
+    .how-step {
+      background: #0d0d0d; border: 1px solid #1f1f1f; border-radius: 12px;
+      padding: 20px 16px; text-align: center;
+    }
+    .how-step .num {
+      width: 32px; height: 32px; border-radius: 50%;
+      background: #1a1a2e; color: #7c6af5; font-weight: 700;
+      display: flex; align-items: center; justify-content: center;
+      margin: 0 auto 10px;
+    }
+    .how-step p { font-size: 13px; color: #888; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="logo">Invi<span>Link</span></div>
+    <div class="badge">BETA</div>
+  </header>
+
+  <main>
+    <h1>Görünmez <span>Bağlantı</span></h1>
+    <p class="subtitle">Bir görsele gizli URL göm. Mobil uygulama ile ekrandan okut, alışverişe yönlendir.</p>
+
+    <div class="card">
+      <h2>Filigran Oluştur</h2>
+
+      <div class="drop-zone" id="dropZone">
+        <input type="file" id="fileInput" accept="image/jpeg,image/png,image/webp" />
+        <div class="drop-icon">🖼️</div>
+        <div class="drop-label">Görsel sürükle veya <strong>seç</strong></div>
+        <div style="font-size:12px;color:#555;margin-top:4px;">JPEG · PNG · WEBP</div>
+      </div>
+
+      <div id="preview-wrap">
+        <img id="preview" alt="Önizleme" />
+      </div>
+
+      <label for="urlInput">Ürün URL'i</label>
+      <input type="url" id="urlInput"
+             placeholder="https://www.beymen.com/tr/p_..." />
+
+      <button class="btn" id="submitBtn" disabled>
+        <div class="spinner" id="spinner"></div>
+        <span id="btnText">Filigran Ekle</span>
+      </button>
+    </div>
+
+    <div class="result" id="result">
+      <div class="result-inner">
+        <div class="result-title">✓ Filigran başarıyla eklendi</div>
+        <div class="code-badge" id="codeDisplay"></div>
+        <div class="result-info">
+          Bu kod görselin içine gömüldü. Mobil uygulama ekrandan okuyunca ürün sayfasına yönlendirir.
+        </div>
+        <a id="downloadBtn" class="download-btn" download>
+          ⬇ Filigranli Gorsel İndir
+        </a>
+      </div>
+    </div>
+
+    <div class="error" id="errorBox"></div>
+
+    <div class="card" style="margin-top:40px;">
+      <h2>Nasıl Çalışır?</h2>
+      <div class="how">
+        <div class="how-step">
+          <div class="num">1</div>
+          <p>Görseli ve ürün URL'ini yükle</p>
+        </div>
+        <div class="how-step">
+          <div class="num">2</div>
+          <p>Filigranli görseli videoya veya ekrana koy</p>
+        </div>
+        <div class="how-step">
+          <div class="num">3</div>
+          <p>Kullanıcı InviLink uygulamasıyla ekranı tara → satın alma sayfası açılır</p>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    const fileInput = document.getElementById('fileInput');
+    const dropZone = document.getElementById('dropZone');
+    const preview = document.getElementById('preview');
+    const previewWrap = document.getElementById('preview-wrap');
+    const urlInput = document.getElementById('urlInput');
+    const submitBtn = document.getElementById('submitBtn');
+    const spinner = document.getElementById('spinner');
+    const btnText = document.getElementById('btnText');
+    const result = document.getElementById('result');
+    const errorBox = document.getElementById('errorBox');
+
+    let selectedFile = null;
+
+    function checkReady() {
+      submitBtn.disabled = !(selectedFile && urlInput.value.startsWith('http'));
+    }
+
+    function handleFile(file) {
+      if (!file || !file.type.startsWith('image/')) return;
+      selectedFile = file;
+      const reader = new FileReader();
+      reader.onload = e => {
+        preview.src = e.target.result;
+        previewWrap.style.display = 'block';
+        dropZone.querySelector('.drop-icon').textContent = '✓';
+      };
+      reader.readAsDataURL(file);
+      checkReady();
+    }
+
+    fileInput.addEventListener('change', e => handleFile(e.target.files[0]));
+    urlInput.addEventListener('input', checkReady);
+
+    dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+    dropZone.addEventListener('drop', e => {
+      e.preventDefault();
+      dropZone.classList.remove('dragover');
+      handleFile(e.dataTransfer.files[0]);
+    });
+
+    submitBtn.addEventListener('click', async () => {
+      if (!selectedFile || !urlInput.value) return;
+
+      submitBtn.disabled = true;
+      spinner.style.display = 'block';
+      btnText.textContent = 'İşleniyor...';
+      result.style.display = 'none';
+      errorBox.style.display = 'none';
+
+      try {
+        const form = new FormData();
+        form.append('image', selectedFile);
+        form.append('url', urlInput.value);
+
+        const res = await fetch('/api/links', { method: 'POST', body: form });
+
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.detail || 'Sunucu hatasi');
+        }
+
+        const code = res.headers.get('X-InviLink-Code');
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+
+        document.getElementById('codeDisplay').textContent = code;
+        document.getElementById('downloadBtn').href = url;
+        document.getElementById('downloadBtn').download = `invilink_${code}.png`;
+        result.style.display = 'block';
+        result.scrollIntoView({ behavior: 'smooth' });
+      } catch (err) {
+        errorBox.textContent = '⚠ ' + err.message;
+        errorBox.style.display = 'block';
+      } finally {
+        spinner.style.display = 'none';
+        btnText.textContent = 'Filigran Ekle';
+        submitBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  backend:
+    build: .
+    platform: linux/amd64   # M1 Mac icin gerekli
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=sqlite:///./invilink.db
+      - MODEL_CACHE_DIR=/app/model_cache
+    volumes:
+      - model_cache:/app/model_cache   # Model tekrar indirilmesin
+    restart: unless-stopped
+
+volumes:
+  model_cache:
