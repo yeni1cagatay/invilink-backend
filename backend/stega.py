@@ -56,6 +56,8 @@ class StegaStamp:
                 self.sess, [tag_constants.SERVING], model_path
             )
             sig = model.signature_def[signature_constants.DEFAULT_SERVING_SIGNATURE_DEF_KEY]
+            print("[STEGA] inputs:", list(sig.inputs.keys()))
+            print("[STEGA] outputs:", list(sig.outputs.keys()))
             self.input_secret = self.sess.graph.get_tensor_by_name(
                 sig.inputs["secret"].name
             )
