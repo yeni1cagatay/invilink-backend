@@ -7,7 +7,7 @@ from typing import Optional
 from sqlalchemy import Column, DateTime, Integer, String, create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./invilink.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:////app/data/invilink.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -33,6 +33,16 @@ class Link(Base):
     scan_count = Column(Integer, default=0)
 
 
+class VideoLink(Base):
+    __tablename__ = "video_links"
+
+    wm_id = Column(Integer, primary_key=True, index=True)  # 0-255
+    url = Column(String(2048), nullable=False)
+    label = Column(String(256), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    scan_count = Column(Integer, default=0)
+
+
 Base.metadata.create_all(bind=engine)
 
 
@@ -46,6 +56,35 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def create_video_link(db: Session, url: str, label: str = "") -> VideoLink:
+    """Boş bir wm_id bul (0-255) ve video link oluştur."""
+    used = {r.wm_id for r in db.query(VideoLink.wm_id).all()}
+    free = [i for i in range(256) if i not in used]
+    if not free:
+        raise RuntimeError("Tüm 256 video slot dolu")
+    wm_id = random.choice(free)
+    vl = VideoLink(wm_id=wm_id, url=url, label=label or url[:80])
+    db.add(vl)
+    db.commit()
+    db.refresh(vl)
+    return vl
+
+
+def get_video_link(db: Session, wm_id: int) -> Optional[VideoLink]:
+    return db.query(VideoLink).filter(VideoLink.wm_id == wm_id).first()
+
+
+def increment_video_scan(db: Session, wm_id: int) -> None:
+    vl = get_video_link(db, wm_id)
+    if vl:
+        vl.scan_count += 1
+        db.commit()
+
+
+def list_video_links(db: Session):
+    return db.query(VideoLink).order_by(VideoLink.created_at.desc()).all()
 
 
 def create_link(db: Session, url: str) -> Link:

@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: brandion-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: DATABASE_URL
+        value: sqlite:////app/data/invilink.db
+    disk:
+      name: brandion-data
+      mountPath: /app/data
+      sizeGB: 1
