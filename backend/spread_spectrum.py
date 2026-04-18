@@ -13,9 +13,11 @@ from typing import Optional
 # ─── SABITLER ────────────────────────────────────────────────────────────────
 
 NUM_IDS     = 256       # 0-255 arası unique ID
-EPSILON     = 8         # piksel başına sinyal gücü (±8)
+EPSILON     = 20        # piksel başına sinyal gücü — ekran→kamera için yüksek
 SEED_OFFSET = 0xB4A710  # gizli seed — brute force zorlaştırır
-THRESHOLD   = 10.0      # korelasyon eşiği — watermark:~230, gürültü:~3
+THRESHOLD   = 8.0       # korelasyon eşiği
+DECODE_W    = 1920      # decode için standart genişlik
+DECODE_H    = 1080      # decode için standart yükseklik
 
 # ─── PN DİZİSİ ───────────────────────────────────────────────────────────────
 
@@ -58,8 +60,9 @@ def encode_frame(frame: Image.Image, id_val: int) -> Image.Image:
 def decode(frame: Image.Image, num_ids: int = NUM_IDS) -> Optional[int]:
     """
     Tek frame → ID.
-    Tüm ID'lerle korelasyon hesapla, en yükseği döndür.
+    Kamera fotoğrafı overlay boyutuna indirgenir, sonra korelasyon.
     """
+    frame = frame.resize((DECODE_W, DECODE_H), Image.LANCZOS)
     gray = np.array(frame.convert("L")).astype(np.float32).flatten()
     # DC bileşeni çıkar
     gray -= gray.mean()
