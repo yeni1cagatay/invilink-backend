@@ -1,7 +1,7 @@
 """
 Brandion Spread Spectrum Watermark
 ====================================
-Block-based PN pattern — düşük frekans, ekran→kamera dayanıklı.
+Block-based PN — ekran→kamera, 16:9 crop ile dayanıklı decode.
 """
 
 from __future__ import annotations
@@ -11,18 +11,17 @@ from typing import Optional
 
 # ─── SABITLER ────────────────────────────────────────────────────────────────
 
-NUM_IDS     = 256       # 0-255 arası unique ID
-EPSILON     = 35        # blok başına sinyal gücü — ekran→kamera için güçlü
-SEED_OFFSET = 0xB4A710  # gizli seed
-BLOCK_SIZE  = 16        # piksel blok boyutu — JPEG ve kamera bulanıklığından sağ çıkar
-THRESHOLD   = 6.0       # korelasyon eşiği
+NUM_IDS     = 256
+EPSILON     = 50        # güçlü sinyal — ekran→kamera kanal kaybı için
+SEED_OFFSET = 0xB4A710
+BLOCK_SIZE  = 64        # büyük blok — ölçek değişimine dayanıklı
+THRESHOLD   = 5.0
 DECODE_W    = 1920
 DECODE_H    = 1080
 
-# ─── BLOK TABANLI PN DESENİ ──────────────────────────────────────────────────
+# ─── BLOK PN ─────────────────────────────────────────────────────────────────
 
 def _pn_blocks(id_val: int, height: int, width: int) -> np.ndarray:
-    """16x16 blok bazlı ±1 desen — düşük frekans, dayanıklı."""
     bh = (height + BLOCK_SIZE - 1) // BLOCK_SIZE
     bw = (width  + BLOCK_SIZE - 1) // BLOCK_SIZE
     rng = np.random.default_rng(seed=id_val ^ SEED_OFFSET)
@@ -33,16 +32,14 @@ def _pn_blocks(id_val: int, height: int, width: int) -> np.ndarray:
 # ─── ENCODE ──────────────────────────────────────────────────────────────────
 
 def encode_overlay(id_val: int, width: int = 1920, height: int = 1080) -> Image.Image:
-    """Post prodüksiyon overlay PNG — blok desen, Add blend modda üste koy."""
     pn = _pn_blocks(id_val, height, width)
     overlay = np.clip(128 + EPSILON * pn, 0, 255).astype(np.uint8)
     rgb = np.stack([overlay] * 3, axis=-1)
-    print(f"[SS] overlay id={id_val} size={width}x{height} ε={EPSILON} block={BLOCK_SIZE}")
+    print(f"[SS] overlay id={id_val} ε={EPSILON} block={BLOCK_SIZE}")
     return Image.fromarray(rgb, mode="RGB")
 
 
 def encode_frame(frame: Image.Image, id_val: int) -> Image.Image:
-    """Var olan frame'e doğrudan gömme."""
     arr = np.array(frame.convert("RGB")).astype(np.float32)
     h, w = arr.shape[:2]
     pn = _pn_blocks(id_val, h, w)
@@ -52,8 +49,23 @@ def encode_frame(frame: Image.Image, id_val: int) -> Image.Image:
 
 # ─── DECODE ──────────────────────────────────────────────────────────────────
 
+def _crop_16_9(img: Image.Image) -> Image.Image:
+    """Merkezi 16:9 crop — dikey telefon fotoğrafını düzeltir."""
+    w, h = img.size
+    target_ratio = 16 / 9
+    if w / h > target_ratio:
+        new_w = int(h * target_ratio)
+        x = (w - new_w) // 2
+        return img.crop((x, 0, x + new_w, h))
+    else:
+        new_h = int(w / target_ratio)
+        y = (h - new_h) // 2
+        return img.crop((0, y, w, y + new_h))
+
+
 def decode(frame: Image.Image, num_ids: int = NUM_IDS) -> Optional[int]:
-    """Kamera fotoğrafı → ID. Önce 1920x1080'e indirgenir."""
+    """Kamera fotoğrafı → ID. 16:9 crop → 1920x1080 resize → korelasyon."""
+    frame = _crop_16_9(frame)
     frame = frame.resize((DECODE_W, DECODE_H), Image.LANCZOS)
     gray = np.array(frame.convert("L")).astype(np.float32)
     h, w = gray.shape
