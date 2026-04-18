@@ -7,7 +7,7 @@ from typing import Optional
 from sqlalchemy import Column, DateTime, Integer, String, create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:////app/data/invilink.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:////app/invilink.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
