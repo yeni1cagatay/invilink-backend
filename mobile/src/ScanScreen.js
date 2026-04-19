@@ -2,10 +2,10 @@ import { useNavigation } from "@react-navigation/native";
 import axios from "axios";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import * as ImageManipulator from "expo-image-manipulator";
+import * as ImagePicker from "expo-image-picker";
 import * as Linking from "expo-linking";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  ActivityIndicator,
   Animated,
   StyleSheet,
   Text,
@@ -16,91 +16,166 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { API_URL } from "./config";
 
-const SCAN_INTERVAL_MS = 1500; // Her 1.5 saniyede bir frame gonder
+const SCAN_INTERVAL_MS = 1200;
+const MULTI_FRAME_COUNT = 3;   // kaç frame biriktirince decode-multi'ye gönder
 
 export default function ScanScreen() {
   const navigation = useNavigation();
   const [permission, requestPermission] = useCameraPermissions();
-  const [status, setStatus] = useState("scanning"); // scanning | found | error | no_watermark
+  const [status, setStatus] = useState("scanning");
+  const [foundLabel, setFoundLabel] = useState(null);
   const [foundUrl, setFoundUrl] = useState(null);
+
   const cameraRef = useRef(null);
   const scanning = useRef(false);
   const intervalRef = useRef(null);
+  const frameBuffer = useRef([]);   // multi-frame biriktirme
   const pulseAnim = useRef(new Animated.Value(1)).current;
+  const dotAnim = useRef(new Animated.Value(1)).current;
 
-  // Tarama animasyonu
   useEffect(() => {
     Animated.loop(
       Animated.sequence([
-        Animated.timing(pulseAnim, { toValue: 1.08, duration: 800, useNativeDriver: true }),
-        Animated.timing(pulseAnim, { toValue: 1, duration: 800, useNativeDriver: true }),
+        Animated.timing(pulseAnim, { toValue: 1.04, duration: 900, useNativeDriver: true }),
+        Animated.timing(pulseAnim, { toValue: 1, duration: 900, useNativeDriver: true }),
+      ])
+    ).start();
+    Animated.loop(
+      Animated.sequence([
+        Animated.timing(dotAnim, { toValue: 0.3, duration: 600, useNativeDriver: true }),
+        Animated.timing(dotAnim, { toValue: 1, duration: 600, useNativeDriver: true }),
       ])
     ).start();
   }, []);
 
-  const sendFrame = useCallback(async () => {
-    if (scanning.current || !cameraRef.current) return;
-    scanning.current = true;
-
-    try {
-      // Frame yakala
-      const photo = await cameraRef.current.takePictureAsync({
-        quality: 0.7,
-        skipProcessing: true,
-      });
-
-      // 400x400'e yeniden boyutlandir (model bu boyutu bekliyor)
-      const resized = await ImageManipulator.manipulateAsync(
-        photo.uri,
-        [{ resize: { width: 400, height: 400 } }],
-        { compress: 0.8, format: ImageManipulator.SaveFormat.JPEG }
-      );
-
-      // Sunucuya gonder
-      const form = new FormData();
-      form.append("image", {
-        uri: resized.uri,
-        type: "image/jpeg",
-        name: "frame.jpg",
-      });
-
-      const res = await axios.post(`${API_URL}/api/decode`, form, {
-        headers: { "Content-Type": "multipart/form-data" },
-        timeout: 8000,
-      });
-
-      // Filigran bulundu!
-      Vibration.vibrate(200);
-      clearInterval(intervalRef.current);
-      setFoundUrl(res.data.url);
-      setStatus("found");
-
-      // 1 saniye sonra tarayiciyi ac
-      setTimeout(() => {
-        Linking.openURL(res.data.url);
-      }, 1000);
-    } catch (err) {
-      if (err.response?.status === 404) {
-        // Filigran yok — taramaya devam
-        setStatus("scanning");
-      } else {
-        // Baglanti hatasi vb.
-        setStatus("error");
-        clearInterval(intervalRef.current);
-      }
-    } finally {
-      scanning.current = false;
-    }
+  const showFound = useCallback((url, label) => {
+    Vibration.vibrate([0, 80, 60, 80]);
+    clearInterval(intervalRef.current);
+    scanning.current = false;
+    setFoundUrl(url);
+    setFoundLabel(label || url);
+    setStatus("found");
   }, []);
 
-  // Kamera izni alininca taramayı baslat
+  const resetToScanning = useCallback(() => {
+    setStatus("scanning");
+    setFoundUrl(null);
+    setFoundLabel(null);
+    scanning.current = false;
+    frameBuffer.current = [];
+  }, []);
+
+  const sendSingleFrame = useCallback(async (uri) => {
+    const form = new FormData();
+    form.append("image", { uri, type: "image/jpeg", name: "frame.jpg" });
+    const res = await axios.post(`${API_URL}/api/ss/decode`, form, {
+      headers: { "Content-Type": "multipart/form-data" },
+      timeout: 15000,
+    });
+    return res.data;
+  }, []);
+
+  const sendMultiFrame = useCallback(async (uris) => {
+    const form = new FormData();
+    uris.forEach((uri, i) =>
+      form.append("images", { uri, type: "image/jpeg", name: `frame${i}.jpg` })
+    );
+    const res = await axios.post(`${API_URL}/api/ss/decode-multi`, form, {
+      headers: { "Content-Type": "multipart/form-data" },
+      timeout: 20000,
+    });
+    return res.data;
+  }, []);
+
+  const scanFrame = useCallback(async () => {
+    if (scanning.current || !cameraRef.current) return;
+    scanning.current = true;
+    try {
+      const photo = await cameraRef.current.takePictureAsync({
+        quality: 0.92,
+        skipProcessing: true,
+      });
+      const resized = await ImageManipulator.manipulateAsync(
+        photo.uri,
+        [{ resize: { width: 1080 } }],
+        { compress: 0.92, format: ImageManipulator.SaveFormat.JPEG }
+      );
+      const uri = resized.uri;
+
+      // Önce tek frame dene (hızlı yol)
+      try {
+        const data = await sendSingleFrame(uri);
+        showFound(data.url, data.label);
+        return;
+      } catch { /* single frame yetmedi, buffer'a ekle */ }
+
+      // Multi-frame buffer
+      frameBuffer.current.push(uri);
+      if (frameBuffer.current.length >= MULTI_FRAME_COUNT) {
+        const uris = frameBuffer.current.splice(0, MULTI_FRAME_COUNT);
+        setStatus("processing");
+        try {
+          const data = await sendMultiFrame(uris);
+          showFound(data.url, data.label);
+          return;
+        } catch { /* multi da olmadı, devam et */ }
+      }
+
+      setStatus("scanning");
+      scanning.current = false;
+    } catch {
+      scanning.current = false;
+      setStatus("scanning");
+    }
+  }, [sendSingleFrame, sendMultiFrame, showFound]);
+
   useEffect(() => {
     if (!permission?.granted) return;
-    intervalRef.current = setInterval(sendFrame, SCAN_INTERVAL_MS);
+    intervalRef.current = setInterval(scanFrame, SCAN_INTERVAL_MS);
     return () => clearInterval(intervalRef.current);
-  }, [permission, sendFrame]);
+  }, [permission, scanFrame]);
 
-  // --- Izin ekrani ---
+  const pickFromGallery = useCallback(async () => {
+    clearInterval(intervalRef.current);
+    scanning.current = false;
+    frameBuffer.current = [];
+
+    const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!perm.granted) {
+      resetToScanning();
+      return;
+    }
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ["images"],
+      quality: 1,
+    });
+
+    if (result.canceled) {
+      resetToScanning();
+      intervalRef.current = setInterval(scanFrame, SCAN_INTERVAL_MS);
+      return;
+    }
+
+    try {
+      setStatus("processing");
+      const data = await sendSingleFrame(result.assets[0].uri);
+      showFound(data.url, data.label);
+    } catch {
+      resetToScanning();
+      intervalRef.current = setInterval(scanFrame, SCAN_INTERVAL_MS);
+    }
+  }, [sendImageToAPI, resetToScanning, scanFrame]);
+
+  const handleGo = useCallback(() => {
+    if (foundUrl) Linking.openURL(foundUrl);
+  }, [foundUrl]);
+
+  const handleBack = useCallback(() => {
+    resetToScanning();
+    intervalRef.current = setInterval(scanFrame, SCAN_INTERVAL_MS);
+  }, [resetToScanning, scanFrame]);
+
   if (!permission) return <View style={styles.container} />;
 
   if (!permission.granted) {
@@ -109,7 +184,7 @@ export default function ScanScreen() {
         <View style={styles.permBox}>
           <Text style={styles.permTitle}>Kamera İzni Gerekli</Text>
           <Text style={styles.permSub}>
-            Ekrandaki görünmez filigranı okumak için kamera erişimine ihtiyacımız var.
+            Ekrandaki görünmez filigranı okumak için kamera erişimi gerekiyor.
           </Text>
           <TouchableOpacity style={styles.permBtn} onPress={requestPermission}>
             <Text style={styles.permBtnText}>İzin Ver</Text>
@@ -121,105 +196,191 @@ export default function ScanScreen() {
 
   return (
     <View style={styles.container}>
-      <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" />
+      <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" zoom={0.0} />
 
-      {/* Karartma + Kılavuz Çerçeve */}
       <View style={styles.overlay}>
-        <View style={styles.topMask} />
-        <View style={styles.middleRow}>
-          <View style={styles.sideMask} />
-          <Animated.View
-            style={[styles.viewfinder, { transform: [{ scale: pulseAnim }] }]}
-          >
+        <SafeAreaView edges={["top"]}>
+          <View style={styles.topBar}>
+            <TouchableOpacity
+              style={styles.backBtn}
+              onPress={() => { clearInterval(intervalRef.current); navigation.goBack(); }}
+            >
+              <Text style={styles.backBtnText}>←</Text>
+            </TouchableOpacity>
+            <Text style={styles.topTitle}>
+              Brand<Text style={styles.topTitleAccent}>ion</Text>
+            </Text>
+            <View style={{ width: 40 }} />
+          </View>
+        </SafeAreaView>
+
+        <View style={styles.viewfinderWrap}>
+          <Animated.View style={[styles.viewfinder, { transform: [{ scale: pulseAnim }] }]}>
             <View style={[styles.corner, styles.tl]} />
             <View style={[styles.corner, styles.tr]} />
             <View style={[styles.corner, styles.bl]} />
             <View style={[styles.corner, styles.br]} />
+            {status === "found" && (
+              <View style={styles.foundOverlay}>
+                <Text style={styles.foundCheck}>✓</Text>
+              </View>
+            )}
           </Animated.View>
-          <View style={styles.sideMask} />
         </View>
-        <View style={styles.bottomMask}>
-          <StatusBar status={status} foundUrl={foundUrl} />
-          <TouchableOpacity
-            style={styles.backBtn}
-            onPress={() => { clearInterval(intervalRef.current); navigation.goBack(); }}
-          >
-            <Text style={styles.backBtnText}>← Geri</Text>
-          </TouchableOpacity>
+
+        <View style={styles.bottomPanel}>
+          {status === "scanning" && (
+            <View style={styles.pill}>
+              <Animated.View style={[styles.dot, { opacity: dotAnim }]} />
+              <Text style={styles.pillText}>Taranıyor…</Text>
+            </View>
+          )}
+
+          {status === "processing" && (
+            <View style={styles.pill}>
+              <Animated.View style={[styles.dot, styles.dotYellow, { opacity: dotAnim }]} />
+              <Text style={styles.pillText}>Analiz ediliyor…</Text>
+            </View>
+          )}
+
+          {status === "found" && (
+            <View style={styles.popup}>
+              <View style={styles.popupIconRow}>
+                <View style={styles.popupIconBadge}>
+                  <Text style={styles.popupIcon}>✦</Text>
+                </View>
+              </View>
+              <Text style={styles.popupLabel} numberOfLines={2}>{foundLabel}</Text>
+              <Text style={styles.popupSub}>Filigran tespit edildi</Text>
+              <View style={styles.popupButtons}>
+                <TouchableOpacity style={styles.btnBack} onPress={handleBack} activeOpacity={0.7}>
+                  <Text style={styles.btnBackText}>Geri</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.btnGo} onPress={handleGo} activeOpacity={0.85}>
+                  <Text style={styles.btnGoText}>Siteye Git  →</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          )}
+
+          {status !== "found" && (
+            <TouchableOpacity style={styles.galleryBtn} onPress={pickFromGallery} activeOpacity={0.75}>
+              <Text style={styles.galleryIcon}>⊕</Text>
+              <Text style={styles.galleryBtnText}>Galeriden Seç</Text>
+            </TouchableOpacity>
+          )}
+
+          {status !== "found" && (
+            <Text style={styles.hint}>Ekrana 20–40 cm uzakta tut, sabit bırak</Text>
+          )}
         </View>
       </View>
     </View>
   );
 }
 
-function StatusBar({ status, foundUrl }) {
-  if (status === "found") {
-    return (
-      <View style={[styles.statusBox, styles.statusFound]}>
-        <Text style={styles.statusIcon}>✓</Text>
-        <Text style={styles.statusText}>Filigran bulundu! Açılıyor...</Text>
-      </View>
-    );
-  }
-  if (status === "error") {
-    return (
-      <View style={[styles.statusBox, styles.statusError]}>
-        <Text style={styles.statusIcon}>⚠</Text>
-        <Text style={styles.statusText}>Bağlantı hatası. Tekrar dene.</Text>
-      </View>
-    );
-  }
-  return (
-    <View style={styles.statusBox}>
-      <ActivityIndicator color="#7c6af5" size="small" />
-      <Text style={styles.statusText}>Ekrana tut, taranıyor...</Text>
-    </View>
-  );
-}
-
-const CORNER = 24;
-const BORDER = 3;
+const VF = 260;
+const CORNER = 26;
+const CB = 3;
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#000" },
-  overlay: { flex: 1 },
-  topMask: { flex: 1, backgroundColor: "rgba(0,0,0,0.6)" },
-  middleRow: { flexDirection: "row", height: 260 },
-  sideMask: { flex: 1, backgroundColor: "rgba(0,0,0,0.6)" },
-  bottomMask: {
-    flex: 1, backgroundColor: "rgba(0,0,0,0.6)",
-    alignItems: "center", justifyContent: "flex-start", paddingTop: 24, gap: 16,
+  overlay: { flex: 1, justifyContent: "space-between" },
+
+  topBar: {
+    flexDirection: "row", alignItems: "center", justifyContent: "space-between",
+    paddingHorizontal: 16, paddingVertical: 12,
+    backgroundColor: "rgba(0,0,0,0.5)",
   },
-  viewfinder: {
-    width: 260, height: 260,
-    borderWidth: 0,
+  backBtn: {
+    width: 40, height: 40, borderRadius: 20,
+    backgroundColor: "rgba(255,255,255,0.08)",
+    alignItems: "center", justifyContent: "center",
   },
-  corner: {
-    position: "absolute", width: CORNER, height: CORNER,
-    borderColor: "#7c6af5", borderWidth: BORDER,
-  },
+  backBtnText: { color: "#f0f0f0", fontSize: 18 },
+  topTitle: { fontSize: 18, fontWeight: "700", color: "#f0f0f0", letterSpacing: -0.5 },
+  topTitleAccent: { color: "#7c6af5" },
+
+  viewfinderWrap: { flex: 1, alignItems: "center", justifyContent: "center" },
+  viewfinder: { width: VF, height: VF, borderRadius: 4, overflow: "hidden" },
+  corner: { position: "absolute", width: CORNER, height: CORNER, borderColor: "#7c6af5", borderWidth: CB },
   tl: { top: 0, left: 0, borderRightWidth: 0, borderBottomWidth: 0 },
   tr: { top: 0, right: 0, borderLeftWidth: 0, borderBottomWidth: 0 },
   bl: { bottom: 0, left: 0, borderRightWidth: 0, borderTopWidth: 0 },
   br: { bottom: 0, right: 0, borderLeftWidth: 0, borderTopWidth: 0 },
-  statusBox: {
-    flexDirection: "row", alignItems: "center", gap: 10,
-    backgroundColor: "rgba(255,255,255,0.08)",
-    paddingHorizontal: 20, paddingVertical: 12,
-    borderRadius: 30,
+  foundOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(74,222,128,0.15)",
+    alignItems: "center", justifyContent: "center",
   },
-  statusFound: { backgroundColor: "rgba(76,175,80,0.2)" },
-  statusError: { backgroundColor: "rgba(244,67,54,0.2)" },
-  statusIcon: { fontSize: 16 },
-  statusText: { color: "#f0f0f0", fontSize: 14, fontWeight: "500" },
-  backBtn: { paddingHorizontal: 20, paddingVertical: 10 },
-  backBtnText: { color: "#888", fontSize: 15 },
-  permBox: {
-    flex: 1, alignItems: "center", justifyContent: "center",
-    paddingHorizontal: 40, gap: 16,
+  foundCheck: { fontSize: 72, color: "#4ade80" },
+
+  bottomPanel: {
+    backgroundColor: "rgba(0,0,0,0.65)",
+    paddingTop: 24, paddingBottom: 40, paddingHorizontal: 24,
+    alignItems: "center", gap: 14,
   },
+  pill: {
+    flexDirection: "row", alignItems: "center", gap: 8,
+    backgroundColor: "rgba(255,255,255,0.06)",
+    paddingHorizontal: 20, paddingVertical: 11,
+    borderRadius: 30, borderWidth: 1, borderColor: "rgba(255,255,255,0.08)",
+  },
+  pillText: { color: "#f0f0f0", fontSize: 14, fontWeight: "500" },
+  dot: {
+    width: 7, height: 7, borderRadius: 4, backgroundColor: "#7c6af5",
+    shadowColor: "#7c6af5", shadowOpacity: 1, shadowRadius: 4,
+    shadowOffset: { width: 0, height: 0 },
+  },
+  dotYellow: { backgroundColor: "#facc15", shadowColor: "#facc15" },
+
+  popup: {
+    backgroundColor: "rgba(12,10,24,0.97)",
+    borderRadius: 28, paddingHorizontal: 24, paddingVertical: 28,
+    width: "100%", gap: 12,
+    borderWidth: 1, borderColor: "rgba(124,106,245,0.25)",
+    shadowColor: "#7c6af5", shadowOpacity: 0.3, shadowRadius: 24,
+    shadowOffset: { width: 0, height: 0 },
+  },
+  popupIconRow: { alignItems: "center" },
+  popupIconBadge: {
+    width: 44, height: 44, borderRadius: 14,
+    backgroundColor: "rgba(124,106,245,0.15)",
+    borderWidth: 1, borderColor: "rgba(124,106,245,0.3)",
+    alignItems: "center", justifyContent: "center",
+  },
+  popupIcon: { fontSize: 20, color: "#7c6af5" },
+  popupLabel: { color: "#f0f0f0", fontSize: 16, fontWeight: "700", textAlign: "center", lineHeight: 22 },
+  popupSub: { color: "#4ade80", fontSize: 12, fontWeight: "500", textAlign: "center", letterSpacing: 0.5 },
+  popupButtons: { flexDirection: "row", gap: 10, marginTop: 4 },
+  btnBack: {
+    flex: 1, paddingVertical: 15, borderRadius: 16,
+    backgroundColor: "rgba(255,255,255,0.06)",
+    borderWidth: 1, borderColor: "rgba(255,255,255,0.08)",
+    alignItems: "center",
+  },
+  btnBackText: { color: "#666", fontWeight: "600", fontSize: 14 },
+  btnGo: {
+    flex: 2, paddingVertical: 15, borderRadius: 16,
+    backgroundColor: "#7c6af5", alignItems: "center",
+    shadowColor: "#7c6af5", shadowOpacity: 0.5, shadowRadius: 12,
+    shadowOffset: { width: 0, height: 4 },
+  },
+  btnGoText: { color: "#fff", fontWeight: "700", fontSize: 15, letterSpacing: 0.3 },
+
+  galleryBtn: {
+    flexDirection: "row", alignItems: "center", gap: 8,
+    paddingVertical: 13, paddingHorizontal: 28, borderRadius: 30,
+    borderWidth: 1, borderColor: "rgba(124,106,245,0.35)",
+    backgroundColor: "rgba(124,106,245,0.08)",
+  },
+  galleryIcon: { color: "#7c6af5", fontSize: 16 },
+  galleryBtnText: { color: "#a89ef5", fontSize: 14, fontWeight: "600", letterSpacing: 0.2 },
+  hint: { color: "#444", fontSize: 11, letterSpacing: 0.3 },
+
+  permBox: { flex: 1, alignItems: "center", justifyContent: "center", paddingHorizontal: 40, gap: 16 },
   permTitle: { fontSize: 22, fontWeight: "700", color: "#f0f0f0" },
-  permSub: { fontSize: 15, color: "#888", textAlign: "center", lineHeight: 22 },
+  permSub: { fontSize: 15, color: "#666", textAlign: "center", lineHeight: 22 },
   permBtn: {
     backgroundColor: "#7c6af5", borderRadius: 12,
     paddingHorizontal: 32, paddingVertical: 14, marginTop: 8,

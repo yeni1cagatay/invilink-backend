@@ -103,9 +103,32 @@ async def ss_decode(
 ):
     """Tek fotoğraf → Spread Spectrum decode → URL."""
     img = Image.open(io.BytesIO(await image.read()))
-    wm_id = ss.decode(img)
+    wm_id, best_corr, margin = ss.decode_scores(img)
     if wm_id is None:
-        raise HTTPException(status_code=404, detail="Filigran bulunamadı")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Filigran bulunamadı (corr={best_corr:.2f} margin={margin:.2f})",
+        )
+    vl = get_video_link(db, wm_id)
+    if not vl:
+        raise HTTPException(status_code=404, detail="ID kayıtlı değil")
+    increment_video_scan(db, wm_id)
+    return {"url": vl.url, "wm_id": wm_id, "label": vl.label}
+
+
+@app.post("/api/ss/decode-multi")
+async def ss_decode_multi(
+    images: list[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+):
+    """2-5 fotoğraf → korelasyon ortalaması → URL. Tek frame'den daha dayanıklı."""
+    frames = [Image.open(io.BytesIO(await img.read())) for img in images]
+    wm_id, best_avg = ss.decode_multi(frames)
+    if wm_id is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Filigran bulunamadı (avg_corr={best_avg:.2f})",
+        )
     vl = get_video_link(db, wm_id)
     if not vl:
         raise HTTPException(status_code=404, detail="ID kayıtlı değil")
