@@ -14,6 +14,7 @@ from database import (create_link, get_db, get_link, increment_scan,
 import watermark
 import temporal_watermark as twm
 import spread_spectrum as ss
+import dct_watermark as dct
 
 app = FastAPI(title="Brandion API", version="1.0.0")
 
@@ -312,6 +313,58 @@ async def stats(code: str, db: Session = Depends(get_db)):
         "scan_count": link.scan_count,
         "created_at": link.created_at.isoformat(),
     }
+
+
+# ─── DCT WATERMARK ───────────────────────────────────────────────────────────
+
+@app.post("/api/dct/encode")
+async def dct_encode(
+    image: UploadFile = File(...),
+    wm_id: int = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Görsel + wm_id → DCT filigranlanmış PNG indir."""
+    vl = get_video_link(db, wm_id)
+    if not vl:
+        raise HTTPException(status_code=404, detail="wm_id bulunamadı")
+    img = Image.open(io.BytesIO(await image.read()))
+    encoded = dct.encode(img, wm_id)
+    buf = io.BytesIO()
+    encoded.save(buf, format="PNG")
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="image/png",
+        headers={"Content-Disposition": f'attachment; filename="dct_{wm_id}.png"'})
+
+
+@app.post("/api/dct/decode")
+async def dct_decode(
+    image: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Kamera frame → DCT decode → URL."""
+    raw = await image.read()
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    wm_id = dct.decode(img)
+    if wm_id is None:
+        raise HTTPException(status_code=404, detail="Filigran bulunamadı")
+    vl = get_video_link(db, wm_id)
+    if not vl:
+        raise HTTPException(status_code=404, detail="ID kayıtlı değil")
+    increment_video_scan(db, wm_id)
+    return {"url": vl.url, "wm_id": wm_id, "label": vl.label}
+
+
+@app.get("/api/dct/overlay/{wm_id}")
+async def dct_overlay(wm_id: int, db: Session = Depends(get_db)):
+    """wm_id → noise overlay PNG indir. Video editörde Screen blend ile kullan."""
+    if not get_video_link(db, wm_id):
+        raise HTTPException(status_code=404, detail="wm_id bulunamadı")
+    img = dct.generate_noise_overlay(wm_id)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="image/png",
+        headers={"Content-Disposition": f'attachment; filename="overlay_{wm_id}.png"'})
 
 
 @app.post("/api/ss/diagnose")

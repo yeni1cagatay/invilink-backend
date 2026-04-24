@@ -16,8 +16,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { API_URL } from "./config";
 
-const SCAN_INTERVAL_MS = 1200;
-const MULTI_FRAME_COUNT = 3;   // kaç frame biriktirince decode-multi'ye gönder
+const VIDEO_DURATION_MS = 1500;  // kısa video süresi — exposure ayarlanır
 
 export default function ScanScreen() {
   const navigation = useNavigation();
@@ -29,7 +28,6 @@ export default function ScanScreen() {
   const cameraRef = useRef(null);
   const scanning = useRef(false);
   const intervalRef = useRef(null);
-  const frameBuffer = useRef([]);
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const dotAnim = useRef(new Animated.Value(1)).current;
 
@@ -62,27 +60,24 @@ export default function ScanScreen() {
     setFoundUrl(null);
     setFoundLabel(null);
     scanning.current = false;
-    frameBuffer.current = [];
   }, []);
 
   const sendSingleFrame = useCallback(async (uri) => {
     const form = new FormData();
     form.append("image", { uri, type: "image/jpeg", name: "frame.jpg" });
-    const res = await axios.post(`${API_URL}/api/ss/decode`, form, {
+    const res = await axios.post(`${API_URL}/api/dct/decode`, form, {
       headers: { "Content-Type": "multipart/form-data" },
-      timeout: 15000,
+      timeout: 20000,
     });
     return res.data;
   }, []);
 
-  const sendMultiFrame = useCallback(async (uris) => {
+  const sendVideo = useCallback(async (uri) => {
     const form = new FormData();
-    uris.forEach((uri, i) =>
-      form.append("images", { uri, type: "image/jpeg", name: `frame${i}.jpg` })
-    );
-    const res = await axios.post(`${API_URL}/api/ss/decode-multi`, form, {
+    form.append("video", { uri, type: "video/mp4", name: "scan.mp4" });
+    const res = await axios.post(`${API_URL}/api/decode-video`, form, {
       headers: { "Content-Type": "multipart/form-data" },
-      timeout: 20000,
+      timeout: 30000,
     });
     return res.data;
   }, []);
@@ -90,67 +85,41 @@ export default function ScanScreen() {
   const scanFrame = useCallback(async () => {
     if (scanning.current || !cameraRef.current) return;
     scanning.current = true;
+    setStatus("processing");
     try {
-      const photo = await cameraRef.current.takePictureAsync({
-        quality: 0.92,
-        skipProcessing: false,
-      });
-      const resized = await ImageManipulator.manipulateAsync(
-        photo.uri,
-        [{ resize: { width: 1080 } }],
-        { compress: 1, format: ImageManipulator.SaveFormat.PNG }
-      );
-      const uri = resized.uri;
+      // Kısa video çek — exposure ayarlanır, çok daha robust
+      cameraRef.current.recordAsync({ maxDuration: VIDEO_DURATION_MS / 1000 });
+      await new Promise(r => setTimeout(r, VIDEO_DURATION_MS));
+      const video = await cameraRef.current.stopRecording();
+      if (!video?.uri) throw new Error("video yok");
 
-      // Önce tek frame dene (hızlı yol)
-      try {
-        const data = await sendSingleFrame(uri);
-        showFound(data.url, data.label);
-        return;
-      } catch { /* single frame yetmedi, buffer'a ekle */ }
-
-      // Multi-frame buffer
-      frameBuffer.current.push(uri);
-      if (frameBuffer.current.length >= MULTI_FRAME_COUNT) {
-        const uris = frameBuffer.current.splice(0, MULTI_FRAME_COUNT);
-        setStatus("processing");
-        try {
-          const data = await sendMultiFrame(uris);
-          showFound(data.url, data.label);
-          return;
-        } catch { /* multi da olmadı, devam et */ }
-      }
-
-      setStatus("scanning");
-      scanning.current = false;
+      const data = await sendVideo(video.uri);
+      showFound(data.url, data.label);
     } catch {
       scanning.current = false;
       setStatus("scanning");
+      // Bir sonraki deneme için bekle
+      intervalRef.current = setTimeout(scanFrame, 2000);
     }
-  }, [sendSingleFrame, sendMultiFrame, showFound]);
+  }, [sendVideo, showFound]);
 
   useEffect(() => {
     if (!permission?.granted) return;
-    // Kamera sensörü hazır olana kadar 3sn bekle
-    const startup = setTimeout(() => {
-      intervalRef.current = setInterval(scanFrame, SCAN_INTERVAL_MS);
-    }, 3000);
+    // Kamera sensörü hazır olana kadar 2sn bekle, sonra video scan başlat
+    const startup = setTimeout(() => scanFrame(), 2000);
     return () => {
       clearTimeout(startup);
-      clearInterval(intervalRef.current);
+      clearTimeout(intervalRef.current);
+      try { cameraRef.current?.stopRecording(); } catch {}
     };
   }, [permission, scanFrame]);
 
   const pickFromGallery = useCallback(async () => {
-    clearInterval(intervalRef.current);
+    clearTimeout(intervalRef.current);
     scanning.current = false;
-    frameBuffer.current = [];
 
     const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (!perm.granted) {
-      resetToScanning();
-      return;
-    }
+    if (!perm.granted) { resetToScanning(); return; }
 
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ["images"],
@@ -159,7 +128,7 @@ export default function ScanScreen() {
 
     if (result.canceled) {
       resetToScanning();
-      intervalRef.current = setInterval(scanFrame, SCAN_INTERVAL_MS);
+      intervalRef.current = setTimeout(scanFrame, 500);
       return;
     }
 
@@ -169,7 +138,7 @@ export default function ScanScreen() {
       showFound(data.url, data.label);
     } catch {
       resetToScanning();
-      intervalRef.current = setInterval(scanFrame, SCAN_INTERVAL_MS);
+      intervalRef.current = setTimeout(scanFrame, 500);
     }
   }, [sendSingleFrame, showFound, resetToScanning, scanFrame]);
 
@@ -179,7 +148,7 @@ export default function ScanScreen() {
 
   const handleBack = useCallback(() => {
     resetToScanning();
-    intervalRef.current = setInterval(scanFrame, SCAN_INTERVAL_MS);
+    intervalRef.current = setTimeout(scanFrame, 500);
   }, [resetToScanning, scanFrame]);
 
   if (!permission) return <View style={styles.container} />;
@@ -209,6 +178,7 @@ export default function ScanScreen() {
         facing="back"
         zoom={0.0}
         autofocus="on"
+        mode="video"
       />
 
       {/* Top — notch area with Brandion */}
