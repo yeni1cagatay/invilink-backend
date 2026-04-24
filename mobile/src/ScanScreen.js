@@ -87,21 +87,15 @@ export default function ScanScreen() {
     scanning.current = true;
     setStatus("processing");
     try {
-      // Kısa video çek — exposure ayarlanır, çok daha robust
-      cameraRef.current.recordAsync({ maxDuration: VIDEO_DURATION_MS / 1000 });
-      await new Promise(r => setTimeout(r, VIDEO_DURATION_MS));
-      const video = await cameraRef.current.stopRecording();
-      if (!video?.uri) throw new Error("video yok");
-
-      const data = await sendVideo(video.uri);
+      const photo = await cameraRef.current.takePictureAsync({ quality: 0.9, skipProcessing: true });
+      const data = await sendSingleFrame(photo.uri);
       showFound(data.url, data.label);
     } catch {
       scanning.current = false;
       setStatus("scanning");
-      // Bir sonraki deneme için bekle
       intervalRef.current = setTimeout(scanFrame, 2000);
     }
-  }, [sendVideo, showFound]);
+  }, [sendSingleFrame, showFound]);
 
   useEffect(() => {
     if (!permission?.granted) return;

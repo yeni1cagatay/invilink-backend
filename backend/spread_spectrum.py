@@ -58,6 +58,19 @@ def encode_overlay(id_val: int, width: int = ENCODE_W, height: int = ENCODE_H) -
     return Image.fromarray(rgb, mode="RGB")
 
 
+def encode_noise_overlay(id_val: int, width: int = ENCODE_W, height: int = ENCODE_H) -> Image.Image:
+    """Gürültü görünümlü SS overlay — DCT noise gibi görünür ama SS decode eder."""
+    rng = np.random.default_rng(seed=id_val ^ 0xBDA3)
+    noise = rng.standard_normal((height, width, 3)).astype(np.float32) * 55
+    base = np.clip(128 + noise, 0, 255).astype(np.float32)
+    tile = _tile_pn(id_val)
+    full = _tile_to_full(tile, height, width)
+    for c in range(3):
+        base[:, :, c] = np.clip(base[:, :, c] + 80 * full, 0, 255)
+    print(f"[SS] noise_overlay id={id_val} ε=80 tile={TILE_W}×{TILE_H}")
+    return Image.fromarray(base.astype(np.uint8), mode="RGB")
+
+
 def encode_frame(frame: Image.Image, id_val: int) -> Image.Image:
     arr = np.array(frame.convert("RGB")).astype(np.float32)
     h, w = arr.shape[:2]

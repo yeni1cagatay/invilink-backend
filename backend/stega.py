@@ -116,8 +116,8 @@ class StegaStamp:
         res = residual[0]
         print(f"[STEGA] residual min={res.min():.4f} max={res.max():.4f} mean={res.mean():.4f} std={res.std():.4f}")
 
-        # Orijinal gorsel + cok kucuk perturbation = gorunmez filigran
-        out = np.clip(img_np + res, 0, 1)
+        # Orijinal gorsel + perturbation (x2 = kamera icin daha guclü ama hala gorunmez)
+        out = np.clip(img_np + 2.0 * res, 0, 1)
         diff = np.abs(res).mean()
         print(f"[STEGA] pixel diff mean={diff:.4f}")
         return Image.fromarray((out * 255).astype(np.uint8))

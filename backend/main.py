@@ -155,6 +155,18 @@ async def ss_overlay_get(wm_id: int, db: Session = Depends(get_db)):
         headers={"Content-Disposition": f'attachment; filename="overlay_{wm_id}.png"'})
 
 
+@app.get("/api/ss/noise/{wm_id}")
+async def ss_noise_overlay(wm_id: int, db: Session = Depends(get_db)):
+    """Gürültü görünümlü SS overlay — tarayıcıda görüntüle."""
+    if not get_video_link(db, wm_id):
+        raise HTTPException(status_code=404, detail="wm_id bulunamadı")
+    img = ss.encode_noise_overlay(wm_id)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="image/png")
+
+
 @app.post("/api/ss/overlay")
 async def ss_overlay(
     wm_id: int = Form(...),
