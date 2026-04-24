@@ -29,7 +29,7 @@ export default function ScanScreen() {
   const cameraRef = useRef(null);
   const scanning = useRef(false);
   const intervalRef = useRef(null);
-  const frameBuffer = useRef([]);   // multi-frame biriktirme
+  const frameBuffer = useRef([]);
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const dotAnim = useRef(new Animated.Value(1)).current;
 
@@ -93,12 +93,12 @@ export default function ScanScreen() {
     try {
       const photo = await cameraRef.current.takePictureAsync({
         quality: 0.92,
-        skipProcessing: true,
+        skipProcessing: false,
       });
       const resized = await ImageManipulator.manipulateAsync(
         photo.uri,
         [{ resize: { width: 1080 } }],
-        { compress: 0.92, format: ImageManipulator.SaveFormat.JPEG }
+        { compress: 1, format: ImageManipulator.SaveFormat.PNG }
       );
       const uri = resized.uri;
 
@@ -131,8 +131,14 @@ export default function ScanScreen() {
 
   useEffect(() => {
     if (!permission?.granted) return;
-    intervalRef.current = setInterval(scanFrame, SCAN_INTERVAL_MS);
-    return () => clearInterval(intervalRef.current);
+    // Kamera sensörü hazır olana kadar 3sn bekle
+    const startup = setTimeout(() => {
+      intervalRef.current = setInterval(scanFrame, SCAN_INTERVAL_MS);
+    }, 3000);
+    return () => {
+      clearTimeout(startup);
+      clearInterval(intervalRef.current);
+    };
   }, [permission, scanFrame]);
 
   const pickFromGallery = useCallback(async () => {
@@ -165,7 +171,7 @@ export default function ScanScreen() {
       resetToScanning();
       intervalRef.current = setInterval(scanFrame, SCAN_INTERVAL_MS);
     }
-  }, [sendImageToAPI, resetToScanning, scanFrame]);
+  }, [sendSingleFrame, showFound, resetToScanning, scanFrame]);
 
   const handleGo = useCallback(() => {
     if (foundUrl) Linking.openURL(foundUrl);
@@ -196,101 +202,108 @@ export default function ScanScreen() {
 
   return (
     <View style={styles.container}>
-      <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" zoom={0.0} />
+      {/* Camera full screen */}
+      <CameraView
+        ref={cameraRef}
+        style={StyleSheet.absoluteFill}
+        facing="back"
+        zoom={0.0}
+        autofocus="on"
+      />
 
-      <View style={styles.overlay}>
-        <SafeAreaView edges={["top"]}>
-          <View style={styles.topBar}>
-            <TouchableOpacity
-              style={styles.backBtn}
-              onPress={() => { clearInterval(intervalRef.current); navigation.goBack(); }}
-            >
-              <Text style={styles.backBtnText}>←</Text>
-            </TouchableOpacity>
-            <Text style={styles.topTitle}>
-              Brand<Text style={styles.topTitleAccent}>ion</Text>
-            </Text>
-            <View style={{ width: 40 }} />
+      {/* Top — notch area with Brandion */}
+      <SafeAreaView edges={["top"]} style={styles.topSafe}>
+        <View style={styles.topBar}>
+          <TouchableOpacity style={styles.backBtn}
+            onPress={() => { clearInterval(intervalRef.current); navigation.goBack(); }}>
+            <Text style={styles.backBtnText}>←</Text>
+          </TouchableOpacity>
+          <View style={styles.notchPill}>
+            <Text style={styles.topTitle}>Brand<Text style={styles.topTitleAccent}>ion</Text></Text>
           </View>
-        </SafeAreaView>
-
-        <View style={styles.viewfinderWrap}>
-          <Animated.View style={[styles.viewfinder, { transform: [{ scale: pulseAnim }] }]}>
-            <View style={[styles.corner, styles.tl]} />
-            <View style={[styles.corner, styles.tr]} />
-            <View style={[styles.corner, styles.bl]} />
-            <View style={[styles.corner, styles.br]} />
-            {status === "found" && (
-              <View style={styles.foundOverlay}>
-                <Text style={styles.foundCheck}>✓</Text>
-              </View>
-            )}
-          </Animated.View>
+          <View style={{ width: 40 }} />
         </View>
+      </SafeAreaView>
 
-        <View style={styles.bottomPanel}>
-          {status === "scanning" && (
-            <View style={styles.pill}>
-              <Animated.View style={[styles.dot, { opacity: dotAnim }]} />
-              <Text style={styles.pillText}>Taranıyor…</Text>
-            </View>
-          )}
-
-          {status === "processing" && (
-            <View style={styles.pill}>
-              <Animated.View style={[styles.dot, styles.dotYellow, { opacity: dotAnim }]} />
-              <Text style={styles.pillText}>Analiz ediliyor…</Text>
-            </View>
-          )}
-
+      {/* Viewfinder center */}
+      <View style={styles.viewfinderWrap}>
+        <View style={styles.viewfinder}>
+          <View style={[styles.corner, styles.tl]} />
+          <View style={[styles.corner, styles.tr]} />
+          <View style={[styles.corner, styles.bl]} />
+          <View style={[styles.corner, styles.br]} />
           {status === "found" && (
-            <View style={styles.popup}>
-              <View style={styles.popupIconRow}>
-                <View style={styles.popupIconBadge}>
-                  <Text style={styles.popupIcon}>✦</Text>
-                </View>
-              </View>
-              <Text style={styles.popupLabel} numberOfLines={2}>{foundLabel}</Text>
-              <Text style={styles.popupSub}>Filigran tespit edildi</Text>
-              <View style={styles.popupButtons}>
-                <TouchableOpacity style={styles.btnBack} onPress={handleBack} activeOpacity={0.7}>
-                  <Text style={styles.btnBackText}>Geri</Text>
-                </TouchableOpacity>
-                <TouchableOpacity style={styles.btnGo} onPress={handleGo} activeOpacity={0.85}>
-                  <Text style={styles.btnGoText}>Siteye Git  →</Text>
-                </TouchableOpacity>
-              </View>
+            <View style={styles.foundOverlay}>
+              <Text style={styles.foundCheck}>✓</Text>
             </View>
           )}
+          {(status === "scanning" || status === "processing") && (
+            <View style={styles.pillInside}>
+              <Animated.View style={[styles.dot, status === "processing" ? styles.dotYellow : undefined, { opacity: dotAnim }]} />
+              <Text style={styles.pillText}>
+                {status === "scanning" ? "Taranıyor…" : "Analiz ediliyor…"}
+              </Text>
+            </View>
+          )}
+        </View>
+      </View>
 
-          {status !== "found" && (
+      {/* Bottom — home bar area */}
+      <SafeAreaView edges={["bottom"]} style={styles.bottomSafe}>
+        {status === "found" && (
+          <View style={styles.popup}>
+            <View style={styles.popupIconRow}>
+              <View style={styles.popupIconBadge}>
+                <Text style={styles.popupIcon}>✦</Text>
+              </View>
+            </View>
+            <Text style={styles.popupLabel} numberOfLines={2}>{foundLabel}</Text>
+            <Text style={styles.popupSub}>Filigran tespit edildi</Text>
+            <View style={styles.popupButtons}>
+              <TouchableOpacity style={styles.btnBack} onPress={handleBack} activeOpacity={0.7}>
+                <Text style={styles.btnBackText}>Geri</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.btnGo} onPress={handleGo} activeOpacity={0.85}>
+                <Text style={styles.btnGoText}>Siteye Git  →</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
+        {status !== "found" && (
+          <View style={styles.bottomBar}>
             <TouchableOpacity style={styles.galleryBtn} onPress={pickFromGallery} activeOpacity={0.75}>
               <Text style={styles.galleryIcon}>⊕</Text>
               <Text style={styles.galleryBtnText}>Galeriden Seç</Text>
             </TouchableOpacity>
-          )}
-
-          {status !== "found" && (
-            <Text style={styles.hint}>Ekrana 20–40 cm uzakta tut, sabit bırak</Text>
-          )}
-        </View>
-      </View>
+            <View style={styles.homeIndicator} />
+          </View>
+        )}
+      </SafeAreaView>
     </View>
   );
 }
 
-const VF = 260;
-const CORNER = 26;
+const VF = 200;
+const CORNER = 22;
 const CB = 3;
-
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#000" },
-  overlay: { flex: 1, justifyContent: "space-between" },
 
+  topSafe: { backgroundColor: "rgba(0,0,0,0.55)" },
   topBar: {
     flexDirection: "row", alignItems: "center", justifyContent: "space-between",
-    paddingHorizontal: 16, paddingVertical: 12,
-    backgroundColor: "rgba(0,0,0,0.5)",
+    paddingHorizontal: 16, paddingVertical: 10,
+  },
+  notchPill: {
+    backgroundColor: "rgba(0,0,0,0.45)",
+    paddingHorizontal: 18, paddingVertical: 6,
+    borderRadius: 20, borderWidth: 1, borderColor: "rgba(255,255,255,0.08)",
+  },
+
+  bottomSafe: { backgroundColor: "rgba(0,0,0,0.55)" },
+  bottomBar: { alignItems: "center", paddingVertical: 12, gap: 10 },
+  homeIndicator: {
+    width: 120, height: 4, borderRadius: 2, backgroundColor: "rgba(255,255,255,0.3)",
   },
   backBtn: {
     width: 40, height: 40, borderRadius: 20,
@@ -302,7 +315,7 @@ const styles = StyleSheet.create({
   topTitleAccent: { color: "#7c6af5" },
 
   viewfinderWrap: { flex: 1, alignItems: "center", justifyContent: "center" },
-  viewfinder: { width: VF, height: VF, borderRadius: 4, overflow: "hidden" },
+  viewfinder: { width: VF, height: VF, borderRadius: 4, overflow: "hidden", position: "relative" },
   corner: { position: "absolute", width: CORNER, height: CORNER, borderColor: "#7c6af5", borderWidth: CB },
   tl: { top: 0, left: 0, borderRightWidth: 0, borderBottomWidth: 0 },
   tr: { top: 0, right: 0, borderLeftWidth: 0, borderBottomWidth: 0 },
@@ -315,10 +328,12 @@ const styles = StyleSheet.create({
   },
   foundCheck: { fontSize: 72, color: "#4ade80" },
 
-  bottomPanel: {
-    backgroundColor: "rgba(0,0,0,0.65)",
-    paddingTop: 24, paddingBottom: 40, paddingHorizontal: 24,
-    alignItems: "center", gap: 14,
+  pillInside: {
+    position: "absolute", bottom: 14, alignSelf: "center",
+    flexDirection: "row", alignItems: "center", gap: 8,
+    backgroundColor: "rgba(0,0,0,0.55)",
+    paddingHorizontal: 16, paddingVertical: 8,
+    borderRadius: 30, borderWidth: 1, borderColor: "rgba(255,255,255,0.1)",
   },
   pill: {
     flexDirection: "row", alignItems: "center", gap: 8,

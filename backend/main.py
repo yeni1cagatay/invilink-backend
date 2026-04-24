@@ -102,7 +102,12 @@ async def ss_decode(
     db: Session = Depends(get_db),
 ):
     """Tek fotoğraf → Spread Spectrum decode → URL."""
-    img = Image.open(io.BytesIO(await image.read()))
+    import os, time as _time
+    raw = await image.read()
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    dbg = f"/app/debug_ss_{int(_time.time())}.jpg"
+    img.save(dbg, "JPEG", quality=95)
+    print(f"[SS-DBG] frame saved: {dbg} size={img.size} mode={img.mode}")
     wm_id, best_corr, margin = ss.decode_scores(img)
     if wm_id is None:
         raise HTTPException(
@@ -134,6 +139,19 @@ async def ss_decode_multi(
         raise HTTPException(status_code=404, detail="ID kayıtlı değil")
     increment_video_scan(db, wm_id)
     return {"url": vl.url, "wm_id": wm_id, "label": vl.label}
+
+
+@app.get("/api/ss/overlay/{wm_id}")
+async def ss_overlay_get(wm_id: int, db: Session = Depends(get_db)):
+    """GET ile overlay indir — telefon tarayıcısından kullanım için."""
+    if not get_video_link(db, wm_id):
+        raise HTTPException(status_code=404, detail="wm_id bulunamadı")
+    img = ss.encode_overlay(wm_id)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="image/png",
+        headers={"Content-Disposition": f'attachment; filename="overlay_{wm_id}.png"'})
 
 
 @app.post("/api/ss/overlay")
@@ -293,4 +311,36 @@ async def stats(code: str, db: Session = Depends(get_db)):
         "url": link.url,
         "scan_count": link.scan_count,
         "created_at": link.created_at.isoformat(),
+    }
+
+
+@app.post("/api/ss/diagnose")
+async def ss_diagnose(image: UploadFile = File(...)):
+    """DB gerektirmez — kamera görselinin ham korelasyon skorlarını döner."""
+    import spread_spectrum as ss
+    from PIL import Image
+    import io, numpy as np
+
+    img = Image.open(io.BytesIO(await image.read()))
+    candidates = ss._prepare_candidates(img)
+
+    top5_per_candidate = []
+    for idx, gray in enumerate(candidates):
+        flat = gray.flatten()
+        norm = float(np.linalg.norm(flat))
+        if norm < 1e-6:
+            continue
+        pn_mat = ss._pn_matrix(ss.DECODE_H, ss.DECODE_W)
+        corrs = (pn_mat @ flat / norm).tolist()
+        sorted_corrs = sorted(enumerate(corrs), key=lambda x: -x[1])[:5]
+        top5_per_candidate.append({
+            "scale_idx": idx,
+            "top5": [{"id": i, "corr": round(c, 3)} for i, c in sorted_corrs],
+        })
+
+    return {
+        "image_size": list(img.size),
+        "threshold": ss.THRESHOLD,
+        "margin_req": ss.MARGIN,
+        "candidates": top5_per_candidate,
     }
