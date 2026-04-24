@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+from pathlib import Path
 from PIL import Image
 from typing import Optional, Tuple
 
@@ -170,6 +171,68 @@ def generate_noise_overlay(wm_id: int, width: int = ENCODE_W, height: int = ENCO
     return encoded
 
 
+# ─── NEURAL DECODER (lazy load) ──────────────────────────────────────────────
+
+_neural_decoder = None  # HiDDeNDecoder instance, ilk decode'da yüklenir
+
+def _get_neural_decoder():
+    global _neural_decoder
+    if _neural_decoder is not None:
+        return _neural_decoder
+    model_path = Path(__file__).parent / "hidden_decoder.pt"
+    if not model_path.exists():
+        return None
+    try:
+        from hidden_decoder import HiDDeNDecoder
+        _neural_decoder = HiDDeNDecoder.load(model_path)
+        print(f"[DCT] neural decoder yüklendi: {model_path}")
+    except Exception as e:
+        print(f"[DCT] neural decoder yüklenemedi: {e}")
+    return _neural_decoder
+
+
+def _neural_decode(img: Image.Image) -> Optional[int]:
+    """Neural decoder ile multi-crop voting."""
+    decoder = _get_neural_decoder()
+    if decoder is None:
+        return None
+
+    from hidden_decoder import _pil_to_tensor
+    import torch
+
+    arr = np.array(img.convert("RGB"))
+    h, w = arr.shape[:2]
+
+    crops = []
+    # Tam frame + farklı crop'lar
+    for scale in [1.0, 0.85, 0.70]:
+        nh, nw = int(h * scale), int(w * scale)
+        y0, x0 = (h - nh) // 2, (w - nw) // 2
+        crop = Image.fromarray(arr[y0:y0+nh, x0:x0+nw])
+        crops.append(crop)
+
+    # Ekran tespiti varsa ona da bak
+    screens = _detect_screen_regions(arr)
+    for screen_bgr in screens:
+        screen_rgb = cv2.cvtColor(screen_bgr, cv2.COLOR_BGR2RGB)
+        crops.append(Image.fromarray(screen_rgb))
+
+    votes: dict[int, int] = {}
+    for crop in crops[:6]:
+        wm_id = decoder.decode_image(crop)
+        if wm_id is not None:
+            votes[wm_id] = votes.get(wm_id, 0) + 1
+
+    if not votes:
+        return None
+
+    best_id = max(votes, key=votes.__getitem__)
+    if votes[best_id] >= 1:
+        print(f"[DCT] neural decode OK wm_id={best_id} votes={votes}")
+        return best_id
+    return None
+
+
 # ─── DECODE ──────────────────────────────────────────────────────────────────
 
 def _decode_bgr(frame_bgr: np.ndarray) -> Optional[int]:
@@ -195,9 +258,15 @@ def _decode_bgr(frame_bgr: np.ndarray) -> Optional[int]:
 def decode(img: Image.Image) -> Optional[int]:
     """
     PIL kamera frame → wm_id veya None.
-    1) Ekran tespiti + perspective correction dene
-    2) Fallback: tüm frame + crop variantları
+    1) Neural decoder varsa önce onu dene (distorsiyon-robust)
+    2) Ekran tespiti + perspective correction
+    3) Fallback: tüm frame + crop variantları
     """
+    # Neural decoder (eğitilmiş model varsa)
+    wm_id = _neural_decode(img)
+    if wm_id is not None:
+        return wm_id
+
     arr = np.array(img.convert("RGB"))
 
     # Ekran tespiti ile warp
