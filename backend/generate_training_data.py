@@ -48,7 +48,7 @@ def generate(n: int = 5000, seed: int = 42):
     for i in range(start, n):
         wm_id = rng.randint(0, NUM_IDS - 1)
         host  = _random_host_image(rng)
-        enc   = dct.encode(host, wm_id)
+        enc   = dct.encode_camera(host, wm_id)
 
         fname = f"{i:05d}.jpg"
         enc.save(OUT_DIR / fname, "JPEG", quality=JPEG_Q)

@@ -29,7 +29,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, IterableDataset
 
 import dct_watermark as dct
-from brandion_engine import PAYLOAD_BITS
+from brandion_engine import CAMERA_PAYLOAD_BITS as PAYLOAD_BITS, int_to_bits
 from hidden_decoder import HiDDeNDecoder, DECODE_H, DECODE_W, _pil_to_tensor
 
 # ─── SABITLER ────────────────────────────────────────────────────────────────
@@ -43,12 +43,19 @@ SAVE_PATH    = Path(__file__).parent / "hidden_decoder.pt"
 
 # ─── EKRan→KAMERA SİMÜLASYONU ───────────────────────────────────────────────
 
+DISTORT_W = 320   # distorsiyon küçük boyutta — 10x hızlı
+DISTORT_H = 180
+
+
 def simulate_screen_camera(img: Image.Image, rng: random.Random) -> Image.Image:
     """
     Gerçekçi ekran→kamera distorsiyon zinciri:
-    perspektif → blur → gamma → JPEG → renk gürültüsü
+    perspektif → blur → gamma → JPEG → renk gürültüsü.
+    Önce küçült, sonra distort → çok daha hızlı.
     """
-    arr = np.array(img.convert("RGB")).astype(np.float32)
+    # Önce küçült (1280×720 → 320×180), sonra distort
+    img = img.resize((DISTORT_W, DISTORT_H), Image.BILINEAR)
+    arr = np.array(img).astype(np.float32)
     h, w = arr.shape[:2]
 
     # 1. Perspektif warp — ekrana açılı tutma simülasyonu
@@ -125,12 +132,15 @@ class WatermarkDataset(IterableDataset):
         self.steps = steps
         self.seed  = seed
 
+    def __len__(self):
+        return self.steps
+
     def __iter__(self):
         rng = random.Random(self.seed + torch.initial_seed() % 10000)
         for _ in range(self.steps):
             wm_id = rng.randint(0, NUM_IDS - 1)
             host    = _random_host_image(rng)
-            encoded = dct.encode(host, wm_id)
+            encoded = dct.encode_camera(host, wm_id)
             distorted = simulate_screen_camera(encoded, rng)
             x = _pil_to_tensor(distorted)
             target = _build_target_bits(wm_id)
@@ -163,11 +173,8 @@ class PregenDataset(torch.utils.data.Dataset):
 
 
 def _build_target_bits(wm_id: int) -> torch.Tensor:
-    """wm_id → 56-bit float tensor."""
-    from brandion_engine import int_to_bits
-    MAGIC = 0xB8A3
-    checksum = ((MAGIC >> 8) ^ (MAGIC & 0xFF) ^ (wm_id & 0xFF) ^ ((wm_id >> 8) & 0xFF)) & 0xFF
-    bits = int_to_bits(MAGIC, 16) + int_to_bits(wm_id, 32) + int_to_bits(checksum, 8)
+    """wm_id → 8-bit float tensor (0-255)."""
+    bits = int_to_bits(wm_id & 0xFF, PAYLOAD_BITS)
     return torch.tensor(bits, dtype=torch.float32)
 
 
@@ -201,8 +208,13 @@ def train(epochs: int = 50, use_gpu: bool = False, data_dir: Path | None = None)
     for epoch in range(1, epochs + 1):
         model.train()
         if use_pregen:
-            loader = DataLoader(dataset_full, batch_size=BATCH_SIZE,
-                                shuffle=True, num_workers=2, pin_memory=False)
+            # Her epoch'ta 800 sample — tüm 3000'i kullanmak çok yavaş CPU'da
+            subset = torch.utils.data.Subset(
+                dataset_full,
+                torch.randperm(len(dataset_full))[:800].tolist()
+            )
+            loader = DataLoader(subset, batch_size=BATCH_SIZE,
+                                shuffle=True, num_workers=0)
         else:
             dataset = WatermarkDataset(STEPS_EPOCH * BATCH_SIZE, seed=epoch)
             loader  = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=0)
@@ -247,18 +259,18 @@ def train(epochs: int = 50, use_gpu: bool = False, data_dir: Path | None = None)
 @torch.no_grad()
 def _eval_id_accuracy(model: HiDDeNDecoder, device, n: int = 100) -> float:
     """n adet örnek üzerinde wm_id tam doğruluğu ölç."""
+    from brandion_engine import bits_to_int
     model.eval()
     rng = random.Random(9999)
     correct = 0
     for _ in range(n):
         wm_id = rng.randint(0, NUM_IDS - 1)
         host  = _random_host_image(rng)
-        enc   = dct.encode(host, wm_id)
+        enc   = dct.encode_camera(host, wm_id)
         dist  = simulate_screen_camera(enc, rng)
         x     = _pil_to_tensor(dist).unsqueeze(0).to(device)
         bits  = (model(x) > 0.5).long().squeeze(0).tolist()
-        from hidden_decoder import _validate_bits
-        pred_id = _validate_bits(bits)
+        pred_id = bits_to_int(bits[:PAYLOAD_BITS])
         if pred_id == wm_id:
             correct += 1
     model.train()

@@ -21,13 +21,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 
-from brandion_engine import PAYLOAD_BITS, bits_to_int
+from brandion_engine import CAMERA_PAYLOAD_BITS, bits_to_int
 
 # ─── SABITLER ────────────────────────────────────────────────────────────────
 
-DECODE_W = 256   # decoder input size — küçük = hızlı, 256 yeterli
-DECODE_H = 256
-MAGIC    = 0xB8A3
+DECODE_W = 128
+DECODE_H = 128
+PAYLOAD_BITS = CAMERA_PAYLOAD_BITS  # 8 bit — wm_id 0-255
 
 
 # ─── MİMARİ ──────────────────────────────────────────────────────────────────
@@ -47,28 +47,30 @@ class ConvBNReLU(nn.Module):
 
 class HiDDeNDecoder(nn.Module):
     """
-    7x ConvBNReLU(64) → AdaptiveAvgPool(1,1) → Linear(PAYLOAD_BITS)
-    HiDDeN paper'dan uyarlandı (Zhu et al. 2018).
+    128×128 grayscale (Y kanalı) → 5 katman CNN → PAYLOAD_BITS
+    DCT watermark Y kanalında — grayscale yeterli, 3x hızlı.
     """
 
     def __init__(self, payload_bits: int = PAYLOAD_BITS):
         super().__init__()
         self.payload_bits = payload_bits
         self.encoder = nn.Sequential(
-            ConvBNReLU(3, 64),
-            ConvBNReLU(64, 64),
-            ConvBNReLU(64, 64),
-            ConvBNReLU(64, 64),
-            ConvBNReLU(64, 64),
-            ConvBNReLU(64, 64),
-            ConvBNReLU(64, 64),
+            ConvBNReLU(1, 16),
+            nn.MaxPool2d(2),          # 128→64
+            ConvBNReLU(16, 32),
+            nn.MaxPool2d(2),          # 64→32
+            ConvBNReLU(32, 64),
+            nn.MaxPool2d(2),          # 32→16
+            ConvBNReLU(64, 128),
+            nn.MaxPool2d(2),          # 16→8
+            ConvBNReLU(128, 128),
             nn.AdaptiveAvgPool2d((1, 1)),
         )
-        self.fc = nn.Linear(64, payload_bits)
+        self.fc = nn.Linear(128, payload_bits)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, 3, H, W) in [0,1] → (B, payload_bits) in [0,1]"""
-        feat = self.encoder(x).view(x.size(0), -1)
+        feat = self.encoder(x).view(x.size(0), -1)   # (B, 128)
         return torch.sigmoid(self.fc(feat))
 
     # ─── INFERENCE ───────────────────────────────────────────────────────────
@@ -83,10 +85,12 @@ class HiDDeNDecoder(nn.Module):
 
     @torch.no_grad()
     def decode_image(self, img: Image.Image) -> Optional[int]:
-        """PIL image → wm_id veya None (magic+checksum doğrulaması ile)."""
-        x = _pil_to_tensor(img).unsqueeze(0)  # (1, 3, H, W)
+        """PIL image → wm_id (0-255) veya None."""
+        x = _pil_to_tensor(img).unsqueeze(0)
         bits = self.decode_tensor(x)
-        return _validate_bits(bits)
+        if len(bits) >= PAYLOAD_BITS:
+            return bits_to_int(bits[:PAYLOAD_BITS])
+        return None
 
     # ─── SAVE / LOAD ─────────────────────────────────────────────────────────
 
@@ -106,25 +110,11 @@ class HiDDeNDecoder(nn.Module):
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 
 def _pil_to_tensor(img: Image.Image) -> torch.Tensor:
-    """PIL → (3, DECODE_H, DECODE_W) float32 tensor in [0,1]."""
-    img = img.convert("RGB").resize((DECODE_W, DECODE_H), Image.LANCZOS)
-    arr = np.array(img, dtype=np.float32) / 255.0
-    return torch.from_numpy(arr.transpose(2, 0, 1))  # CHW
+    """PIL → (1, DECODE_H, DECODE_W) float32 grayscale tensor in [0,1].
+    Y kanalı kullan — DCT watermark orada."""
+    img = img.convert("YCbCr").resize((DECODE_W, DECODE_H), Image.LANCZOS)
+    y = np.array(img, dtype=np.float32)[:, :, 0] / 255.0  # Y channel only
+    return torch.from_numpy(y).unsqueeze(0)  # (1, H, W)
 
 
-def _validate_bits(bits: list[int]) -> Optional[int]:
-    """56-bit payload → wm_id veya None."""
-    if len(bits) < PAYLOAD_BITS:
-        return None
-    magic    = bits_to_int(bits[0:16])
-    wm_id    = bits_to_int(bits[16:48])
-    checksum = bits_to_int(bits[48:56])
-
-    if magic != MAGIC:
-        return None
-
-    expected = ((MAGIC >> 8) ^ (MAGIC & 0xFF) ^ (wm_id & 0xFF) ^ ((wm_id >> 8) & 0xFF)) & 0xFF
-    if checksum != expected:
-        return None
-
-    return wm_id
+# No validation needed — caller checks DB for valid wm_id

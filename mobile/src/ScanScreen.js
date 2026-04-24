@@ -65,7 +65,7 @@ export default function ScanScreen() {
   const sendSingleFrame = useCallback(async (uri) => {
     const form = new FormData();
     form.append("image", { uri, type: "image/jpeg", name: "frame.jpg" });
-    const res = await axios.post(`${API_URL}/api/dct/decode`, form, {
+    const res = await axios.post(`${API_URL}/api/ss/decode`, form, {
       headers: { "Content-Type": "multipart/form-data" },
       timeout: 20000,
     });

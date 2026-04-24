@@ -81,6 +81,26 @@ def decode_error_correction(bits: list[int]) -> list[int]:
     return result
 
 
+def add_ecc_n(bits: list[int], n: int) -> list[int]:
+    """Nx tekrar kodu — her bit n kez tekrarlanır."""
+    return [b for b in bits for _ in range(n)]
+
+
+def decode_ecc_n(bits: list[int], n: int) -> list[int]:
+    """Nx tekrar kodunu çözer — majority vote."""
+    result = []
+    for i in range(0, len(bits) - (n - 1), n):
+        votes = sum(bits[i:i + n])
+        result.append(1 if votes > n / 2 else 0)
+    return result
+
+
+# Kamera decode için: 8-bit payload × 21x ECC = 168 pozisyon
+CAMERA_PAYLOAD_BITS = 8
+CAMERA_ECC_REPS = 21
+CAMERA_SECRET_KEY = 0x43414D31  # "CAM1"
+
+
 def build_payload(content_id: str, scene_id: int, timestamp: int) -> list[int]:
     """
     BRANDION payload formatı (56 bit):

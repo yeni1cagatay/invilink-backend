@@ -22,8 +22,8 @@ BLOCK_SIZE  = 64           # tile içindeki blok boyutu — 64px kamera bulanık
 TILE_BLOCKS = 6            # tile = 6×6 blok = 384×384px
 TILE_W      = BLOCK_SIZE * TILE_BLOCKS   # 384
 TILE_H      = BLOCK_SIZE * TILE_BLOCKS   # 384
-THRESHOLD   = 300.0
-MARGIN      = 50.0
+THRESHOLD   = 200.0
+MARGIN      = 60.0
 ENCODE_W    = 1920
 ENCODE_H    = 1080
 
@@ -245,7 +245,9 @@ def decode_scores(frame: Image.Image) -> Tuple[Optional[int], float, float]:
     for gray in candidates:
         scale = _find_tile_scale(gray)
 
-        for s in [scale, 0.85, 1.15, scale * 2.0, scale * 3.0, 0.5, 1.0]:
+        # Fine grid 0.45-1.0 covers all perspective-warped tile periods
+        fine_grid = [round(0.45 + i * 0.05, 2) for i in range(12)]  # 0.45..1.0
+        for s in [scale, scale * 2.0, scale * 3.0, 0.333, 0.25] + fine_grid:
             if s < 0.3 or s > 5.0:
                 continue
             bid, bcorr, margin = _decode_at_scale(gray, s)
@@ -280,7 +282,8 @@ def decode_multi(frames: list[Image.Image]) -> Tuple[Optional[int], float]:
         candidates = _prepare_gray_candidates(frame)
         for gray in candidates:
             scale = _find_tile_scale(gray)
-            for s in [scale, 0.5, 1.0]:
+            fine_grid = [round(0.45 + i * 0.05, 2) for i in range(12)]
+            for s in [scale, scale * 2.0, scale * 3.0] + fine_grid:
                 if s < 0.3 or s > 5.0:
                     continue
                 atw = int(round(TILE_W * s)); ath = int(round(TILE_H * s))

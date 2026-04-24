@@ -20,6 +20,8 @@ from brandion_engine import (
     BLOCK_SIZE, FREQ_BAND, PAYLOAD_BITS,
     int_to_bits, bits_to_int,
     add_error_correction, decode_error_correction,
+    add_ecc_n, decode_ecc_n,
+    CAMERA_PAYLOAD_BITS, CAMERA_ECC_REPS, CAMERA_SECRET_KEY,
     get_embedding_positions,
     embed_bit_in_block, extract_bit_from_block,
 )
@@ -152,21 +154,75 @@ def _detect_screen_regions(frame_arr: np.ndarray) -> list[np.ndarray]:
     return warped
 
 
+# ─── CAMERA ENCODE (8-bit payload × 21x ECC) ─────────────────────────────────
+
+def encode_camera(img: Image.Image, wm_id: int) -> Image.Image:
+    """
+    Kamera decode için optimize edilmiş encode.
+    8-bit payload × 21x ECC = 168 bit → distorsiyon-robust.
+    """
+    frame = np.array(img.convert("RGB"))
+    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    frame_bgr = cv2.resize(frame_bgr, (ENCODE_W, ENCODE_H), interpolation=cv2.INTER_LANCZOS4)
+
+    ycbcr = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YCrCb)
+    y = ycbcr[:, :, 0].astype(np.float64)
+    h, w = y.shape
+
+    bits = int_to_bits(wm_id & 0xFF, CAMERA_PAYLOAD_BITS)
+    bits_ecc = add_ecc_n(bits, CAMERA_ECC_REPS)  # 8 × 21 = 168 bits
+    positions = get_embedding_positions(h, w, len(bits_ecc), seed=CAMERA_SECRET_KEY)
+
+    y_enc = y.copy()
+    for (row, col), bit in zip(positions, bits_ecc):
+        block = y_enc[row:row + BLOCK_SIZE, col:col + BLOCK_SIZE]
+        if block.shape == (BLOCK_SIZE, BLOCK_SIZE):
+            y_enc[row:row + BLOCK_SIZE, col:col + BLOCK_SIZE] = embed_bit_in_block(block, bit, STRENGTH)
+
+    ycbcr_enc = ycbcr.copy()
+    ycbcr_enc[:, :, 0] = np.clip(y_enc, 0, 255).astype(np.uint8)
+    enc_bgr = cv2.cvtColor(ycbcr_enc, cv2.COLOR_YCrCb2BGR)
+    enc_rgb = cv2.cvtColor(enc_bgr, cv2.COLOR_BGR2RGB)
+
+    psnr = cv2.PSNR(frame_bgr, enc_bgr)
+    print(f"[DCT-CAM] encode wm_id={wm_id} PSNR={psnr:.1f}dB")
+    return Image.fromarray(enc_rgb)
+
+
+def _decode_camera_bgr(frame_bgr: np.ndarray) -> Optional[int]:
+    """BGR frame'den camera schema ile wm_id çöz."""
+    frame_bgr = cv2.resize(frame_bgr, (ENCODE_W, ENCODE_H), interpolation=cv2.INTER_LANCZOS4)
+    ycbcr = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YCrCb)
+    y = ycbcr[:, :, 0].astype(np.float64)
+    h, w = y.shape
+
+    n_bits_ecc = CAMERA_PAYLOAD_BITS * CAMERA_ECC_REPS
+    positions = get_embedding_positions(h, w, n_bits_ecc, seed=CAMERA_SECRET_KEY)
+
+    raw_bits = []
+    for (row, col) in positions:
+        block = y[row:row + BLOCK_SIZE, col:col + BLOCK_SIZE]
+        if block.shape == (BLOCK_SIZE, BLOCK_SIZE):
+            raw_bits.append(extract_bit_from_block(block, STRENGTH))
+
+    corrected = decode_ecc_n(raw_bits, CAMERA_ECC_REPS)
+    if len(corrected) >= CAMERA_PAYLOAD_BITS:
+        return bits_to_int(corrected[:CAMERA_PAYLOAD_BITS])
+    return None
+
+
 # ─── NOISE OVERLAY ───────────────────────────────────────────────────────────
 
 def generate_noise_overlay(wm_id: int, width: int = ENCODE_W, height: int = ENCODE_H) -> Image.Image:
     """
-    Standalone noise overlay PNG üret.
-    Nötr gri zemin üzerine DCT watermark gömülür → TV static görünümü.
+    Standalone noise overlay PNG üret (kamera schema: 8-bit × 21x ECC).
     Video editörde Screen/Overlay blend mode ile içerik üstüne bindirilebilir.
     """
     rng = np.random.default_rng(seed=wm_id ^ 0xBDA3)
-    # TV static grain → encode'un host image'ı
     grain = rng.standard_normal((height, width, 3)).astype(np.float32) * 55
     base_arr = np.clip(128 + grain, 0, 255).astype(np.uint8)
     base = Image.fromarray(base_arr, mode="RGB")
-    # Watermark'ı grain texture'ın içine göm
-    encoded = encode(base, wm_id)
+    encoded = encode_camera(base, wm_id)
     print(f"[DCT] noise overlay wm_id={wm_id} size={width}×{height}")
     return encoded
 
