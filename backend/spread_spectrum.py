@@ -58,17 +58,21 @@ def encode_overlay(id_val: int, width: int = ENCODE_W, height: int = ENCODE_H) -
     return Image.fromarray(rgb, mode="RGB")
 
 
-def encode_noise_overlay(id_val: int, width: int = ENCODE_W, height: int = ENCODE_H) -> Image.Image:
-    """Gürültü görünümlü SS overlay — DCT noise gibi görünür ama SS decode eder."""
-    rng = np.random.default_rng(seed=id_val ^ 0xBDA3)
-    noise = rng.standard_normal((height, width, 3)).astype(np.float32) * 55
-    base = np.clip(128 + noise, 0, 255).astype(np.float32)
+def encode_noise_overlay(id_val: int, width: int = ENCODE_W, height: int = ENCODE_H,
+                          epsilon: int = 25) -> Image.Image:
+    """
+    Pure RGB static görünümlü SS overlay.
+    Her piksel tamamen random RGB — insan gözü pattern görmez.
+    SS sinyali noise altında gömülü, korelatör tarafından okunabilir.
+    """
+    rng = np.random.default_rng(seed=id_val ^ 0xDEAD)
+    noise = rng.integers(0, 256, (height, width, 3), dtype=np.uint8).astype(np.float32)
     tile = _tile_pn(id_val)
     full = _tile_to_full(tile, height, width)
     for c in range(3):
-        base[:, :, c] = np.clip(base[:, :, c] + 80 * full, 0, 255)
-    print(f"[SS] noise_overlay id={id_val} ε=80 tile={TILE_W}×{TILE_H}")
-    return Image.fromarray(base.astype(np.uint8), mode="RGB")
+        noise[:, :, c] = np.clip(noise[:, :, c] + epsilon * full, 0, 255)
+    print(f"[SS] noise_overlay id={id_val} ε={epsilon} pure-RGB tile={TILE_W}×{TILE_H}")
+    return Image.fromarray(noise.astype(np.uint8), mode="RGB")
 
 
 def encode_frame(frame: Image.Image, id_val: int) -> Image.Image:
@@ -325,3 +329,310 @@ def decode_multi(frames: list[Image.Image]) -> Tuple[Optional[int], float]:
     if best_avg > THRESHOLD * 0.75 and margin > MARGIN * 0.75:
         return best_id, best_avg
     return None, best_avg
+
+
+# ─── MED-GRAIN WATERMARK (24px) ─────────────────────────────────────────────
+# 24px bloklar — kamera testinde geçti (corr=3550), 64px'e göre görsel olarak finer.
+# Tile boyutu aynı (384px) → mevcut scale detection değişmez.
+
+MED_BLOCK   = 24
+MED_BLOCKS  = TILE_W // MED_BLOCK   # 16
+MED_SEED    = 0xA3C7E9F1
+MED_THRESH  = 150.0
+MED_MARGIN  = 40.0
+
+
+@functools.lru_cache(maxsize=NUM_IDS)
+def _med_tile_pn(id_val: int) -> np.ndarray:
+    """24px bloklu PN tile (384×384)."""
+    rng = np.random.default_rng(seed=id_val ^ MED_SEED)
+    blocks = rng.choice(np.array([-1, 1], dtype=np.float32),
+                        size=(MED_BLOCKS, MED_BLOCKS))
+    return np.repeat(np.repeat(blocks, MED_BLOCK, axis=0), MED_BLOCK, axis=1)
+
+
+@functools.lru_cache(maxsize=64)
+def _med_pattern_matrix(actual_tile_w: int, actual_tile_h: int,
+                         target_h: int, target_w: int) -> np.ndarray:
+    rows = []
+    for id_val in range(NUM_IDS):
+        tile = _med_tile_pn(id_val)
+        tile_r = cv2.resize(tile, (actual_tile_w, actual_tile_h),
+                            interpolation=cv2.INTER_LINEAR)
+        full = _tile_to_full(tile_r, target_h, target_w).flatten().astype(np.float32)
+        n = np.linalg.norm(full)
+        rows.append(full / n if n > 1e-6 else full)
+    return np.stack(rows)
+
+
+def encode_med_overlay(id_val: int, width: int = ENCODE_W,
+                        height: int = ENCODE_H, epsilon: int = 22,
+                        blur_sigma: float = 18.0) -> Image.Image:
+    """
+    24px blok + Gaussian blur + random noise overlay.
+    Blur blok kenarlarını yumuşatır → göze saf TV static gibi görünür.
+    Kamera için yeterli büyük-ölçekli sinyal korunur.
+    """
+    rng = np.random.default_rng(seed=id_val ^ 0xBEEF2401)
+    noise = rng.integers(0, 256, (height, width, 3), dtype=np.uint8).astype(np.float32)
+    tile = _med_tile_pn(id_val)
+    full = _tile_to_full(tile, height, width)  # sert kenarlar ±1
+
+    # Blok kenarlarını Gaussian blur ile yumuşat → görünür grid yok
+    full_img = Image.fromarray(((full + 1) * 127.5).astype(np.uint8), mode="L")
+    full_blurred = full_img.filter(ImageFilter.GaussianBlur(radius=blur_sigma))
+    full_smooth = (np.array(full_blurred, dtype=np.float32) / 127.5) - 1.0  # tekrar ±1 aralığı
+
+    for c in range(3):
+        noise[:, :, c] = np.clip(noise[:, :, c] + epsilon * full_smooth, 0, 255)
+    print(f"[SS-MED] encode id={id_val} ε={epsilon} blur_σ={blur_sigma} block={MED_BLOCK}px tile={TILE_W}px")
+    return Image.fromarray(noise.astype(np.uint8), mode="RGB")
+
+
+def decode_med_scores(frame: Image.Image) -> Tuple[Optional[int], float, float]:
+    """24px blok decode. FFT scale detection ile scale-invariant."""
+    candidates = _prepare_gray_candidates(frame)
+    if not candidates:
+        return None, 0.0, 0.0
+    candidates = [g for g in candidates if g.std() > 4.0]
+    if not candidates:
+        return None, 0.0, 0.0
+
+    overall_best_id   = None
+    overall_best_corr = -np.inf
+    overall_margin    = 0.0
+
+    for gray in candidates:
+        scale = _find_tile_scale(gray)
+        fine_grid = [round(0.45 + i * 0.05, 2) for i in range(12)]
+        for s in [scale, scale * 2.0, scale * 3.0, 0.333, 0.25] + fine_grid:
+            if s < 0.3 or s > 5.0:
+                continue
+            h, w = gray.shape
+            atw = int(round(TILE_W * s))
+            ath = int(round(TILE_H * s))
+            if atw < 8 or ath < 8:
+                continue
+            gray_flat = gray.flatten().astype(np.float32)
+            norm_g = np.linalg.norm(gray_flat)
+            if norm_g < 1e-6:
+                continue
+            pmat = _med_pattern_matrix(atw, ath, h, w)
+            corrs = pmat @ gray_flat / norm_g * np.sqrt(h * w)
+            idx = np.argsort(corrs)[::-1]
+            bid, bcorr, margin = int(idx[0]), float(corrs[idx[0]]), float(corrs[idx[0]] - corrs[idx[1]])
+            if bcorr > overall_best_corr:
+                overall_best_corr = bcorr
+                overall_best_id   = bid
+                overall_margin    = margin
+
+    print(f"[SS-MED] best_corr={overall_best_corr:.1f} margin={overall_margin:.1f} "
+          f"id={overall_best_id} thr={MED_THRESH}")
+
+    if overall_best_corr > MED_THRESH and overall_margin > MED_MARGIN:
+        return overall_best_id, overall_best_corr, overall_margin
+    return None, overall_best_corr, overall_margin
+
+
+# ─── TEMPORAL MODULATION WATERMARK ───────────────────────────────────────────
+# Her frame tek başına pure random noise.  Sinyal frame FARKINDA gizli.
+# Çift frame: noise + ε×pattern   |   Tek frame: noise − ε×pattern
+# Göz ikisini temporal integrate eder → pattern görmez.
+# Kamera: 2 ardışık frame → diff = ±2ε×pattern → decode.
+
+TEMP_BLOCK   = 32
+TEMP_SEED    = 0xAE19C47B
+TEMP_EPSILON = 30
+
+
+@functools.lru_cache(maxsize=NUM_IDS)
+def _temp_tile_pn(id_val: int) -> np.ndarray:
+    """32px bloklu PN tile (384×384) — temporal encode için."""
+    NBLK = TILE_W // TEMP_BLOCK   # 12
+    rng = np.random.default_rng(seed=id_val ^ TEMP_SEED)
+    blocks = rng.choice(np.array([-1, 1], dtype=np.float32), size=(NBLK, NBLK))
+    return np.repeat(np.repeat(blocks, TEMP_BLOCK, axis=0), TEMP_BLOCK, axis=1)
+
+
+@functools.lru_cache(maxsize=64)
+def _temp_pattern_matrix(actual_tile_w: int, actual_tile_h: int,
+                          target_h: int, target_w: int) -> np.ndarray:
+    rows = []
+    for id_val in range(NUM_IDS):
+        tile = _temp_tile_pn(id_val)
+        tile_r = cv2.resize(tile, (actual_tile_w, actual_tile_h),
+                            interpolation=cv2.INTER_LINEAR)
+        full = _tile_to_full(tile_r, target_h, target_w).flatten().astype(np.float32)
+        n = np.linalg.norm(full)
+        rows.append(full / n if n > 1e-6 else full)
+    return np.stack(rows)
+
+
+def encode_temporal_pair(id_val: int, width: int = ENCODE_W, height: int = ENCODE_H,
+                          epsilon: int = TEMP_EPSILON) -> tuple[Image.Image, Image.Image]:
+    """
+    İki frame üret.  Her biri tek başına pure random noise görünümünde.
+    Fark: ±2×epsilon×PN_pattern  →  decode edilebilir.
+
+    Stüdyo: frame_even'i çift karelere, frame_odd'u tek karelere ekler.
+    """
+    rng = np.random.default_rng(seed=id_val ^ 0xBA5E0015)
+    noise = rng.integers(0, 256, (height, width, 3), dtype=np.uint8).astype(np.float32)
+    tile = _temp_tile_pn(id_val)
+    full = _tile_to_full(tile, height, width)          # (H, W)  ±1
+    pat3 = full[:, :, np.newaxis]                      # broadcast to 3 ch
+
+    frame_even = np.clip(noise + epsilon * pat3, 0, 255).astype(np.uint8)
+    frame_odd  = np.clip(noise - epsilon * pat3, 0, 255).astype(np.uint8)
+    print(f"[SS-TEMP] encode id={id_val} ε={epsilon} block={TEMP_BLOCK}px")
+    return Image.fromarray(frame_even, "RGB"), Image.fromarray(frame_odd, "RGB")
+
+
+def decode_temporal_scores(frame1: Image.Image, frame2: Image.Image,
+                            ) -> Tuple[Optional[int], float, float]:
+    """
+    2 ardışık kamera karesi → temporal fark → decode.
+    Fark = ±2ε×pattern (even−odd veya odd−even, büyüklük aynı).
+    """
+    a1 = np.array(frame1.convert("RGB")).astype(np.float32)
+    a2 = np.array(frame2.convert("RGB")).astype(np.float32)
+
+    # Gri fark: (H, W)
+    diff = (a1 - a2).mean(axis=2)   # even−odd → +2ε×pat
+    diff -= diff.mean()
+
+    h, w = diff.shape
+    diff_flat = diff.flatten()
+    norm_d = np.linalg.norm(diff_flat)
+    if norm_d < 1e-6:
+        return None, 0.0, 0.0
+
+    # Her iki yönü de dene (even−odd ve odd−even)
+    overall_best_id   = None
+    overall_best_corr = -np.inf
+    overall_margin    = 0.0
+
+    for sign in [1.0, -1.0]:
+        signed_flat = sign * diff_flat
+
+        fine_grid = [round(0.45 + i * 0.05, 2) for i in range(12)]
+        for s in [1.0, 0.5, 2.0, 0.333] + fine_grid:
+            if s < 0.3 or s > 5.0:
+                continue
+            atw = int(round(TILE_W * s))
+            ath = int(round(TILE_H * s))
+            if atw < 8 or ath < 8:
+                continue
+            pmat = _temp_pattern_matrix(atw, ath, h, w)
+            corrs = pmat @ signed_flat / norm_d * np.sqrt(h * w)
+            idx = np.argsort(corrs)[::-1]
+            bid = int(idx[0])
+            bcorr = float(corrs[idx[0]])
+            margin = float(corrs[idx[0]] - corrs[idx[1]])
+            if bcorr > overall_best_corr:
+                overall_best_corr = bcorr
+                overall_best_id   = bid
+                overall_margin    = margin
+
+    TEMP_THRESH  = 150.0
+    TEMP_MARGIN  = 40.0
+    print(f"[SS-TEMP] best_corr={overall_best_corr:.1f} margin={overall_margin:.1f} "
+          f"id={overall_best_id} thr={TEMP_THRESH}")
+
+    if overall_best_corr > TEMP_THRESH and overall_margin > TEMP_MARGIN:
+        return overall_best_id, overall_best_corr, overall_margin
+    return None, overall_best_corr, overall_margin
+
+
+# ─── FINE-GRAIN INVISIBLE WATERMARK ──────────────────────────────────────────
+# 8px bloklar — 64px'e göre 8× daha ince, normal TV izleme mesafesinde görünmez.
+# Tile boyutu aynı (384px) → mevcut scale detection değişmez.
+
+FINE_BLOCK    = 8
+FINE_BLOCKS   = TILE_W // FINE_BLOCK   # 48
+FINE_SEED     = 0xF1AE2BCD
+FINE_THRESH   = 180.0
+FINE_MARGIN   = 40.0
+
+@functools.lru_cache(maxsize=NUM_IDS)
+def _fine_tile_pn(id_val: int) -> np.ndarray:
+    """8px bloklu PN tile (384×384). Görsel noise gibi görünür."""
+    rng = np.random.default_rng(seed=id_val ^ FINE_SEED)
+    blocks = rng.choice(np.array([-1, 1], dtype=np.float32),
+                        size=(FINE_BLOCKS, FINE_BLOCKS))
+    return np.repeat(np.repeat(blocks, FINE_BLOCK, axis=0), FINE_BLOCK, axis=1)
+
+
+@functools.lru_cache(maxsize=64)
+def _fine_pattern_matrix(actual_tile_w: int, actual_tile_h: int,
+                          target_h: int, target_w: int) -> np.ndarray:
+    rows = []
+    for id_val in range(NUM_IDS):
+        tile = _fine_tile_pn(id_val)
+        tile_r = cv2.resize(tile, (actual_tile_w, actual_tile_h),
+                            interpolation=cv2.INTER_LINEAR)
+        full = _tile_to_full(tile_r, target_h, target_w).flatten().astype(np.float32)
+        n = np.linalg.norm(full)
+        rows.append(full / n if n > 1e-6 else full)
+    return np.stack(rows)
+
+
+def encode_fine_overlay(id_val: int, width: int = ENCODE_W,
+                         height: int = ENCODE_H, epsilon: int = 80) -> Image.Image:
+    """
+    Pure RGB static görünümlü watermark.
+    8px bloklar + random noise → göze TV static, kameraya okunabilir.
+    """
+    rng = np.random.default_rng(seed=id_val ^ 0xCAFE31AE)
+    noise = rng.integers(0, 256, (height, width, 3), dtype=np.uint8).astype(np.float32)
+    tile = _fine_tile_pn(id_val)
+    full = _tile_to_full(tile, height, width)
+    for c in range(3):
+        noise[:, :, c] = np.clip(noise[:, :, c] + epsilon * full, 0, 255)
+    print(f"[SS-FINE] encode id={id_val} ε={epsilon} block={FINE_BLOCK}px tile={TILE_W}px")
+    return Image.fromarray(noise.astype(np.uint8), mode="RGB")
+
+
+def decode_fine_scores(frame: Image.Image) -> Tuple[Optional[int], float, float]:
+    """Fine-grain (8px) decode. Mevcut FFT scale detection'ı kullanır."""
+    candidates = _prepare_gray_candidates(frame)
+    if not candidates:
+        return None, 0.0, 0.0
+    candidates = [g for g in candidates if g.std() > 4.0]
+    if not candidates:
+        return None, 0.0, 0.0
+
+    overall_best_id   = None
+    overall_best_corr = -np.inf
+    overall_margin    = 0.0
+
+    for gray in candidates:
+        scale = _find_tile_scale(gray)
+        fine_grid = [round(0.45 + i * 0.05, 2) for i in range(12)]
+        for s in [scale, scale * 2.0, scale * 3.0, 0.333, 0.25] + fine_grid:
+            if s < 0.3 or s > 5.0:
+                continue
+            h, w = gray.shape
+            atw = int(round(TILE_W * s))
+            ath = int(round(TILE_H * s))
+            if atw < 8 or ath < 8:
+                continue
+            gray_flat = gray.flatten().astype(np.float32)
+            norm_g = np.linalg.norm(gray_flat)
+            if norm_g < 1e-6:
+                continue
+            pmat = _fine_pattern_matrix(atw, ath, h, w)
+            corrs = pmat @ gray_flat / norm_g * np.sqrt(h * w)
+            idx = np.argsort(corrs)[::-1]
+            bid, bcorr, margin = int(idx[0]), float(corrs[idx[0]]), float(corrs[idx[0]] - corrs[idx[1]])
+            if bcorr > overall_best_corr:
+                overall_best_corr = bcorr
+                overall_best_id   = bid
+                overall_margin    = margin
+
+    print(f"[SS-FINE] best_corr={overall_best_corr:.1f} margin={overall_margin:.1f} "
+          f"id={overall_best_id} thr={FINE_THRESH}")
+
+    if overall_best_corr > FINE_THRESH and overall_margin > FINE_MARGIN:
+        return overall_best_id, overall_best_corr, overall_margin
+    return None, overall_best_corr, overall_margin

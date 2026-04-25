@@ -3,7 +3,7 @@ version: "3.9"
 services:
   backend:
     build: .
-    platform: linux/amd64   # M1 Mac icin gerekli
+    platform: linux/arm64
     ports:
       - "8000:8000"
     environment:

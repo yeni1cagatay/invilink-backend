@@ -62,6 +62,17 @@ export default function ScanScreen() {
     scanning.current = false;
   }, []);
 
+  const sendTwoFrames = useCallback(async (uri1, uri2) => {
+    const form = new FormData();
+    form.append("frame1", { uri: uri1, type: "image/jpeg", name: "f1.jpg" });
+    form.append("frame2", { uri: uri2, type: "image/jpeg", name: "f2.jpg" });
+    const res = await axios.post(`${API_URL}/api/ss/decode-temporal`, form, {
+      headers: { "Content-Type": "multipart/form-data" },
+      timeout: 25000,
+    });
+    return res.data;
+  }, []);
+
   const sendSingleFrame = useCallback(async (uri) => {
     const form = new FormData();
     form.append("image", { uri, type: "image/jpeg", name: "frame.jpg" });
@@ -87,15 +98,19 @@ export default function ScanScreen() {
     scanning.current = true;
     setStatus("processing");
     try {
-      const photo = await cameraRef.current.takePictureAsync({ quality: 0.9, skipProcessing: true });
-      const data = await sendSingleFrame(photo.uri);
+      // 2 ardışık frame çek — temporal fark decode için
+      const opts = { quality: 0.85, skipProcessing: true };
+      const photo1 = await cameraRef.current.takePictureAsync(opts);
+      await new Promise(r => setTimeout(r, 40)); // ~1 TV frame (24fps=42ms)
+      const photo2 = await cameraRef.current.takePictureAsync(opts);
+      const data = await sendTwoFrames(photo1.uri, photo2.uri);
       showFound(data.url, data.label);
     } catch {
       scanning.current = false;
       setStatus("scanning");
       intervalRef.current = setTimeout(scanFrame, 2000);
     }
-  }, [sendSingleFrame, showFound]);
+  }, [sendTwoFrames, showFound]);
 
   useEffect(() => {
     if (!permission?.granted) return;

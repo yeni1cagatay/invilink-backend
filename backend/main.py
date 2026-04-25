@@ -9,8 +9,13 @@ from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from PIL import Image
 from sqlalchemy.orm import Session
 
+import zipfile
+import json as _json
 from database import (create_link, get_db, get_link, increment_scan,
-                       create_video_link, get_video_link, increment_video_scan, list_video_links)
+                       create_video_link, get_video_link, increment_video_scan, list_video_links,
+                       create_short_link, get_short_link, increment_short_scan,
+                       create_project, get_project, list_projects, add_slot)
+import trustmark_engine as tm_engine
 import watermark
 import temporal_watermark as twm
 import spread_spectrum as ss
@@ -29,6 +34,12 @@ app.add_middleware(
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
     with open("dashboard.html", encoding="utf-8") as f:
+        return f.read()
+
+
+@app.get("/studio", response_class=HTMLResponse)
+async def postprod_studio():
+    with open("postprod.html", encoding="utf-8") as f:
         return f.read()
 
 
@@ -76,7 +87,7 @@ async def decode_frame(
 
     # Debug: gelen frame'i kaydet
     import os, time
-    debug_path = f"/app/debug_frame_{int(time.time())}.jpg"
+    debug_path = f"/tmp/debug_frame_{int(time.time())}.jpg"
     img.save(debug_path, "JPEG", quality=95)
     print(f"[DECODE] frame kaydedildi: {debug_path} size={img.size}")
 
@@ -106,7 +117,7 @@ async def ss_decode(
     import os, time as _time
     raw = await image.read()
     img = Image.open(io.BytesIO(raw)).convert("RGB")
-    dbg = f"/app/debug_ss_{int(_time.time())}.jpg"
+    dbg = f"/tmp/debug_ss_{int(_time.time())}.jpg"
     img.save(dbg, "JPEG", quality=95)
     print(f"[SS-DBG] frame saved: {dbg} size={img.size} mode={img.mode}")
     wm_id, best_corr, margin = ss.decode_scores(img)
@@ -409,3 +420,234 @@ async def ss_diagnose(image: UploadFile = File(...)):
         "margin_req": ss.MARGIN,
         "candidates": top5_per_candidate,
     }
+
+
+# ─── TRUSTMARK ───────────────────────────────────────────────────────────────
+
+@app.post("/api/tm/decode")
+async def tm_decode(
+    image: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Kamera frame → TrustMark decode → ürün URL'i."""
+    raw = await image.read()
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    code, detected, conf = tm_engine.decode_watermark(img)
+    if not detected or not code:
+        raise HTTPException(status_code=404, detail=f"Watermark bulunamadı (conf={conf:.2f})")
+    sl = get_short_link(db, code.strip())
+    if not sl:
+        raise HTTPException(status_code=404, detail=f"Kod kayıtlı değil: {code}")
+    increment_short_scan(db, code.strip())
+    return {"url": sl.url, "code": code, "label": sl.label, "confidence": conf}
+
+
+@app.get("/r/{code}")
+async def short_redirect(code: str, db: Session = Depends(get_db)):
+    """brd.io/XXXXXXXX → ürün URL'ine redirect."""
+    sl = get_short_link(db, code)
+    if not sl:
+        raise HTTPException(status_code=404, detail="Bağlantı bulunamadı")
+    increment_short_scan(db, code)
+    return RedirectResponse(url=sl.url, status_code=302)
+
+
+# ─── WATERMARK PROJELERİ ─────────────────────────────────────────────────────
+
+@app.post("/api/projects")
+async def create_project_endpoint(
+    title: str = Form(...),
+    client: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    """Yeni watermark projesi oluştur."""
+    p = create_project(db, title, client)
+    return {"id": p.id, "title": p.title, "client": p.client}
+
+
+@app.get("/api/projects")
+async def list_projects_endpoint(db: Session = Depends(get_db)):
+    projects = list_projects(db)
+    return [
+        {
+            "id": p.id,
+            "title": p.title,
+            "client": p.client,
+            "slot_count": len(p.slots),
+            "created_at": p.created_at.isoformat(),
+        }
+        for p in projects
+    ]
+
+
+@app.get("/api/projects/{project_id}")
+async def get_project_endpoint(project_id: int, db: Session = Depends(get_db)):
+    p = get_project(db, project_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Proje bulunamadı")
+    return {
+        "id": p.id,
+        "title": p.title,
+        "client": p.client,
+        "created_at": p.created_at.isoformat(),
+        "slots": [
+            {
+                "id": s.id,
+                "ts_start": s.ts_start,
+                "ts_end": s.ts_end,
+                "product_name": s.product_name,
+                "product_url": s.product_url,
+                "short_code": s.short_code,
+            }
+            for s in p.slots
+        ],
+    }
+
+
+@app.post("/api/projects/{project_id}/slots")
+async def add_slot_endpoint(
+    project_id: int,
+    ts_start: str = Form(...),
+    ts_end: str = Form(...),
+    product_url: str = Form(...),
+    product_name: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    """Projeye timestamp aralığı + ürün URL'i ekle."""
+    p = get_project(db, project_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Proje bulunamadı")
+    slot = add_slot(db, project_id, ts_start, ts_end, product_url, product_name)
+    return {
+        "id": slot.id,
+        "ts_start": slot.ts_start,
+        "ts_end": slot.ts_end,
+        "product_name": slot.product_name,
+        "short_code": slot.short_code,
+    }
+
+
+@app.get("/api/projects/{project_id}/zip")
+async def download_project_zip(project_id: int, db: Session = Depends(get_db)):
+    """
+    Proje ZIP'i oluştur ve indir.
+    İçerik: her slot için residual PNG + uygulama talimatları.
+    """
+    p = get_project(db, project_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Proje bulunamadı")
+    if not p.slots:
+        raise HTTPException(status_code=400, detail="Projede henüz slot yok")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        readme_lines = [
+            f"# Brandion Watermark Paketi",
+            f"Proje: {p.title}",
+            f"Müşteri: {p.client or '-'}",
+            "",
+            "## Uygulama Talimatları",
+            "1. Her PNG dosyasını After Effects / Premiere / DaVinci'de bir adjustment layer olarak ekleyin.",
+            "2. Blend mode: **Add**",
+            "3. Opacity: **100%** (zaten görünmez — azaltmayın)",
+            "4. Her katmanı yalnızca belirtilen timestamp aralığında aktif yapın.",
+            "",
+            "## Zaman Aralıkları",
+        ]
+
+        for slot in p.slots:
+            readme_lines.append(
+                f"- [{slot.ts_start} → {slot.ts_end}] {slot.product_name}: {slot.product_url}"
+            )
+            png_bytes = tm_engine.generate_residual_png(slot.short_code)
+            filename = f"wm_{slot.ts_start.replace(':','')}-{slot.ts_end.replace(':','')}.png"
+            zf.writestr(filename, png_bytes)
+
+        readme_lines += [
+            "",
+            "## Teknik Detaylar",
+            "- Watermark yöntemi: TrustMark (Adobe Research, CVPR 2024)",
+            "- Çözünürlük: 1920×1080",
+            "- İzleyici Brandion uygulamasıyla ekranı tararsa otomatik ürün sayfasına yönlendirilir.",
+            "",
+            "brandion.io",
+        ]
+        zf.writestr("TALIMATLAR.md", "\n".join(readme_lines))
+
+        slots_data = [
+            {
+                "ts_start": s.ts_start,
+                "ts_end": s.ts_end,
+                "product_name": s.product_name,
+                "product_url": s.product_url,
+                "short_code": s.short_code,
+                "file": f"wm_{s.ts_start.replace(':','')}-{s.ts_end.replace(':','')}.png",
+            }
+            for s in p.slots
+        ]
+        zf.writestr("slots.json", _json.dumps(slots_data, ensure_ascii=False, indent=2))
+
+    buf.seek(0)
+    safe_title = p.title.replace(" ", "_")[:40]
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="brandion_{safe_title}.zip"'},
+    )
+
+
+@app.post("/api/ss/decode-temporal")
+async def ss_decode_temporal(
+    frame1: UploadFile = File(...),
+    frame2: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Temporal modulation decode — 2 ardışık kamera karesi farkından."""
+    raw1 = await frame1.read()
+    raw2 = await frame2.read()
+    img1 = Image.open(io.BytesIO(raw1)).convert("RGB")
+    img2 = Image.open(io.BytesIO(raw2)).convert("RGB")
+    wm_id, corr, margin = ss.decode_temporal_scores(img1, img2)
+    if wm_id is None:
+        raise HTTPException(status_code=404, detail=f"Watermark bulunamadı (corr={corr:.1f})")
+    vl = get_video_link(db, wm_id)
+    if not vl:
+        raise HTTPException(status_code=404, detail="ID kayıtlı değil")
+    increment_video_scan(db, wm_id)
+    return {"url": vl.url, "wm_id": wm_id, "label": vl.label, "corr": corr}
+
+
+@app.post("/api/ss/decode-med")
+async def ss_decode_med(
+    image: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """24px block SS decode — kamera-dayanıklı, 64px'e göre finer görünüm."""
+    raw = await image.read()
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    wm_id, corr, margin = ss.decode_med_scores(img)
+    if wm_id is None:
+        raise HTTPException(status_code=404, detail=f"Watermark bulunamadı (corr={corr:.1f})")
+    vl = get_video_link(db, wm_id)
+    if not vl:
+        raise HTTPException(status_code=404, detail="ID kayıtlı değil")
+    increment_video_scan(db, wm_id)
+    return {"url": vl.url, "wm_id": wm_id, "label": vl.label, "corr": corr}
+
+
+@app.post("/api/ss/decode-fine")
+async def ss_decode_fine(
+    image: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Fine-grain (8px block) SS decode."""
+    raw = await image.read()
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    wm_id, corr, margin = ss.decode_fine_scores(img)
+    if wm_id is None:
+        raise HTTPException(status_code=404, detail=f"Watermark bulunamadı (corr={corr:.1f})")
+    vl = get_video_link(db, wm_id)
+    if not vl:
+        raise HTTPException(status_code=404, detail="ID kayıtlı değil")
+    increment_video_scan(db, wm_id)
+    return {"url": vl.url, "wm_id": wm_id, "label": vl.label, "corr": corr}
