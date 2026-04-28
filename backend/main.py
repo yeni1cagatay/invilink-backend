@@ -158,7 +158,7 @@ async def ss_overlay_get(wm_id: int, db: Session = Depends(get_db)):
     """GET ile overlay indir — telefon tarayıcısından kullanım için."""
     if not get_video_link(db, wm_id):
         raise HTTPException(status_code=404, detail="wm_id bulunamadı")
-    img = ss.encode_overlay(wm_id)
+    img = ss.encode_lab_overlay(wm_id)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)
@@ -188,7 +188,7 @@ async def ss_overlay(
     """wm_id → post prodüksiyon overlay PNG indir."""
     if not get_video_link(db, wm_id):
         raise HTTPException(status_code=404, detail="wm_id bulunamadı")
-    img = ss.encode_overlay(wm_id, width, height)
+    img = ss.encode_lab_overlay(wm_id, width=width, height=height)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)
@@ -594,6 +594,37 @@ async def download_project_zip(project_id: int, db: Session = Depends(get_db)):
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="brandion_{safe_title}.zip"'},
     )
+
+
+@app.get("/api/ss/lab-overlay/{wm_id}")
+async def ss_lab_overlay(wm_id: int, db: Session = Depends(get_db)):
+    """Lab b-kanalı overlay PNG — telefon tarayıcısından aç, kaydet, app ile tara."""
+    if not get_video_link(db, wm_id):
+        raise HTTPException(status_code=404, detail="wm_id bulunamadı")
+    img = ss.encode_lab_overlay(wm_id, epsilon=8.0)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="image/png",
+                             headers={"Content-Disposition": f'inline; filename="lab_{wm_id}.png"'})
+
+
+@app.post("/api/ss/decode-lab")
+async def ss_decode_lab(
+    image: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Lab b-kanalı + HPF decode — invisible 64px blok, kamera-dayanıklı."""
+    raw = await image.read()
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    wm_id, corr, margin = ss.decode_lab_scores(img)
+    if wm_id is None:
+        raise HTTPException(status_code=404, detail=f"Watermark bulunamadı (corr={corr:.1f})")
+    vl = get_video_link(db, wm_id)
+    if not vl:
+        raise HTTPException(status_code=404, detail="ID kayıtlı değil")
+    increment_video_scan(db, wm_id)
+    return {"url": vl.url, "wm_id": wm_id, "label": vl.label, "corr": corr}
 
 
 @app.post("/api/ss/decode-temporal")

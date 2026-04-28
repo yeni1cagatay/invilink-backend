@@ -62,22 +62,29 @@ export default function ScanScreen() {
     scanning.current = false;
   }, []);
 
-  const sendTwoFrames = useCallback(async (uri1, uri2) => {
-    const form = new FormData();
-    form.append("frame1", { uri: uri1, type: "image/jpeg", name: "f1.jpg" });
-    form.append("frame2", { uri: uri2, type: "image/jpeg", name: "f2.jpg" });
-    const res = await axios.post(`${API_URL}/api/ss/decode-temporal`, form, {
-      headers: { "Content-Type": "multipart/form-data" },
-      timeout: 25000,
-    });
-    return res.data;
-  }, []);
-
   const sendSingleFrame = useCallback(async (uri) => {
+    const safeUri = uri.startsWith("file://") ? uri : `file://${uri}`;
     const form = new FormData();
-    form.append("image", { uri, type: "image/jpeg", name: "frame.jpg" });
+    form.append("image", { uri: safeUri, type: "image/jpeg", name: "frame.jpg" });
+
+    // axios'a Content-Type verme — boundary'yi otomatik set etsin
+    // ngrok-skip-browser-warning: interstitial HTML sayfasını atla
+    const headers = { "ngrok-skip-browser-warning": "1" };
+
+    // 1. Lab b-kanalı + HPF
+    try {
+      const res = await axios.post(`${API_URL}/api/ss/decode-lab`, form, {
+        headers,
+        timeout: 20000,
+      });
+      return res.data;
+    } catch (e1) {
+      if (e1?.response?.status !== 404) throw e1;
+    }
+
+    // 2. Klasik SS fallback
     const res = await axios.post(`${API_URL}/api/ss/decode`, form, {
-      headers: { "Content-Type": "multipart/form-data" },
+      headers,
       timeout: 20000,
     });
     return res.data;
@@ -98,19 +105,21 @@ export default function ScanScreen() {
     scanning.current = true;
     setStatus("processing");
     try {
-      // 2 ardışık frame çek — temporal fark decode için
-      const opts = { quality: 0.85, skipProcessing: true };
-      const photo1 = await cameraRef.current.takePictureAsync(opts);
-      await new Promise(r => setTimeout(r, 40)); // ~1 TV frame (24fps=42ms)
-      const photo2 = await cameraRef.current.takePictureAsync(opts);
-      const data = await sendTwoFrames(photo1.uri, photo2.uri);
+      // Düşük kalitede "dummy" kare çek: kamera exposure + odağı bu sahneye kilitler
+      await cameraRef.current.takePictureAsync({ quality: 0.1, skipProcessing: true });
+      // 800ms bekle: exposure & AWB stabilize olsun
+      await new Promise(r => setTimeout(r, 800));
+      // Asıl kareyi al
+      const photo = await cameraRef.current.takePictureAsync({ quality: 1.0, skipProcessing: true });
+      const data = await sendSingleFrame(photo.uri);
       showFound(data.url, data.label);
-    } catch {
+    } catch (err) {
+      console.warn("[ScanFrame error]", err?.message, err?.response?.status, err?.response?.data);
       scanning.current = false;
       setStatus("scanning");
       intervalRef.current = setTimeout(scanFrame, 2000);
     }
-  }, [sendTwoFrames, showFound]);
+  }, [sendSingleFrame, showFound]);
 
   useEffect(() => {
     if (!permission?.granted) return;
@@ -187,7 +196,7 @@ export default function ScanScreen() {
         facing="back"
         zoom={0.0}
         autofocus="on"
-        mode="video"
+        mode="picture"
       />
 
       {/* Top — notch area with Brandion */}

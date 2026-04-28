@@ -168,10 +168,11 @@ def _prepare_gray_candidates(frame: Image.Image) -> list[np.ndarray]:
     candidates = []
 
     def _to_gray(img: Image.Image, target_w: int = 960, target_h: int = 540) -> Optional[np.ndarray]:
-        blurred = img.filter(ImageFilter.GaussianBlur(radius=1.0))
-        resized = blurred.resize((target_w, target_h), Image.LANCZOS)
+        resized = img.resize((target_w, target_h), Image.LANCZOS)
         gray = np.array(resized.convert("L")).astype(np.float32)
-        gray -= gray.mean()
+        # High-pass filter: video içeriğini (düşük frekans) sil, watermark sinyali bırak
+        low = cv2.GaussianBlur(gray, (0, 0), sigmaX=24)
+        gray = gray - low  # yalnızca yüksek/orta frekans kalır
         return gray
 
     # Screen detection
@@ -329,6 +330,133 @@ def decode_multi(frames: list[Image.Image]) -> Tuple[Optional[int], float]:
     if best_avg > THRESHOLD * 0.75 and margin > MARGIN * 0.75:
         return best_id, best_avg
     return None, best_avg
+
+
+# ─── LAB b-CHANNEL WATERMARK ─────────────────────────────────────────────────
+# Göz mavi-sarı (Lab b) değişimine en kör. 64px blok b kanalına gömülü →
+# gözde "renk dalgalanması" gibi görünür, beyin filtreler.
+# Decoder: b kanalı çıkar + HPF → sadece watermark sinyali kalır.
+
+LAB_BLOCK   = 64
+LAB_BLOCKS  = TILE_W // LAB_BLOCK   # 6
+LAB_SEED    = 0xB4C7E2A9
+LAB_THRESH  = 120.0
+LAB_MARGIN  = 30.0
+
+
+@functools.lru_cache(maxsize=NUM_IDS)
+def _lab_tile_pn(id_val: int) -> np.ndarray:
+    rng = np.random.default_rng(seed=id_val ^ LAB_SEED)
+    blocks = rng.choice(np.array([-1, 1], dtype=np.float32),
+                        size=(LAB_BLOCKS, LAB_BLOCKS))
+    return np.repeat(np.repeat(blocks, LAB_BLOCK, axis=0), LAB_BLOCK, axis=1)
+
+
+@functools.lru_cache(maxsize=64)
+def _lab_pattern_matrix(actual_tile_w: int, actual_tile_h: int,
+                         target_h: int, target_w: int) -> np.ndarray:
+    rows = []
+    for id_val in range(NUM_IDS):
+        tile = _lab_tile_pn(id_val)
+        tile_r = cv2.resize(tile, (actual_tile_w, actual_tile_h),
+                            interpolation=cv2.INTER_LINEAR)
+        full = _tile_to_full(tile_r, target_h, target_w).flatten().astype(np.float32)
+        n = np.linalg.norm(full)
+        rows.append(full / n if n > 1e-6 else full)
+    return np.stack(rows)
+
+
+def encode_lab_overlay(id_val: int, width: int = ENCODE_W,
+                        height: int = ENCODE_H, epsilon: float = 8.0) -> Image.Image:
+    """
+    64px PN pattern → Lab b kanalına gömülü noise overlay.
+    Göz b kanalı değişimini algılamaz → invisible.
+    Kamera rengi yakalar → decode edilebilir.
+    epsilon: Lab b birim cinsinden (0-255 aralığı). 8 ≈ JND sınırı.
+    """
+    rng = np.random.default_rng(seed=id_val ^ 0xCAFE1AB1)
+    noise_rgb = rng.integers(0, 256, (height, width, 3), dtype=np.uint8)
+
+    lab = cv2.cvtColor(noise_rgb, cv2.COLOR_RGB2Lab).astype(np.float32)
+    l_ch, a_ch, b_ch = lab[:,:,0], lab[:,:,1], lab[:,:,2]
+
+    tile = _lab_tile_pn(id_val)
+    full = _tile_to_full(tile, height, width)
+
+    # Adaptive masking: dokulu bölgelerde daha güçlü, düz bölgelerde zayıf
+    edges = cv2.Laplacian(l_ch, cv2.CV_32F)
+    mask = cv2.GaussianBlur(np.abs(edges), (11, 11), 0)
+    if mask.max() > 1e-6:
+        mask = mask / mask.max()   # 0-1 normalize
+    mask = 0.3 + 0.7 * mask       # min 0.3, max 1.0
+
+    b_wm = np.clip(b_ch + epsilon * full * mask, 0, 255)
+
+    lab_out = np.stack([l_ch, a_ch, b_wm], axis=2).astype(np.uint8)
+    rgb_out = cv2.cvtColor(lab_out, cv2.COLOR_Lab2RGB)
+    print(f"[SS-LAB] encode id={id_val} ε={epsilon} block={LAB_BLOCK}px")
+    return Image.fromarray(rgb_out, "RGB")
+
+
+def decode_lab_scores(frame: Image.Image) -> Tuple[Optional[int], float, float]:
+    """
+    Lab b kanalı + high-pass filter → PN korelasyon decode.
+    Video içeriği (düşük frekans) filtreden geçemez, sadece watermark kalır.
+    """
+    def _prep(img: Image.Image, target_w: int = 960, target_h: int = 540):
+        resized = img.resize((target_w, target_h), Image.LANCZOS)
+        arr = cv2.cvtColor(np.array(resized), cv2.COLOR_RGB2Lab).astype(np.float32)
+        b = arr[:, :, 2]
+        # High-pass: video içeriğini sil
+        low = cv2.GaussianBlur(b, (0, 0), sigmaX=24)
+        return b - low
+
+    candidates = []
+    screens = _detect_screen_candidates(frame)
+    for s in screens:
+        candidates.append(_prep(s))
+    for scale in [1.0, 0.80, 0.65]:
+        w, h = frame.size
+        nw, nh = int(w * scale), int(h * scale)
+        x, y = (w - nw) // 2, (h - nh) // 2
+        crop = _crop_16_9(frame.crop((x, y, x + nw, y + nh)))
+        candidates.append(_prep(crop))
+
+    candidates = [g for g in candidates if g.std() > 0.5]
+    if not candidates:
+        return None, 0.0, 0.0
+
+    overall_best_id   = None
+    overall_best_corr = -np.inf
+    overall_margin    = 0.0
+
+    for gray in candidates:
+        h, w = gray.shape
+        gray_flat = gray.flatten().astype(np.float32)
+        norm_g = np.linalg.norm(gray_flat)
+        if norm_g < 1e-6:
+            continue
+        fine_grid = [round(0.45 + i * 0.05, 2) for i in range(12)]
+        for s in [1.0, 0.5, 2.0, 0.333, 0.25] + fine_grid:
+            if s < 0.3 or s > 5.0:
+                continue
+            atw = int(round(TILE_W * s))
+            ath = int(round(TILE_H * s))
+            if atw < 8 or ath < 8:
+                continue
+            pmat = _lab_pattern_matrix(atw, ath, h, w)
+            corrs = pmat @ gray_flat / norm_g * np.sqrt(h * w)
+            idx = np.argsort(corrs)[::-1]
+            bid = int(idx[0]); bcorr = float(corrs[idx[0]]); margin = float(corrs[idx[0]] - corrs[idx[1]])
+            if bcorr > overall_best_corr:
+                overall_best_corr = bcorr; overall_best_id = bid; overall_margin = margin
+
+    print(f"[SS-LAB] best_corr={overall_best_corr:.1f} margin={overall_margin:.1f} "
+          f"id={overall_best_id} thr={LAB_THRESH}")
+
+    if overall_best_corr > LAB_THRESH and overall_margin > LAB_MARGIN:
+        return overall_best_id, overall_best_corr, overall_margin
+    return None, overall_best_corr, overall_margin
 
 
 # ─── MED-GRAIN WATERMARK (24px) ─────────────────────────────────────────────
