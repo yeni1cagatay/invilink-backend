@@ -28,7 +28,7 @@ from models import BrandionDecoder, BrandionEncoder, SECRET_SIZE, bits_from_wm_i
 # ─── SABITLER ────────────────────────────────────────────────────────────────
 
 IMG_SIZE   = 400
-BATCH_SIZE = 8      # RTX 3060 12GB → 16 bile kaldırır, 8 güvenli başlangıç
+BATCH_SIZE = 16     # RTX 3060 12GB GDDR6 için optimize
 LR         = 1e-4
 
 W_IMAGE  = 2.0     # YUV image fidelity
@@ -116,14 +116,17 @@ def train(args):
     dataset = ImageFolder(args.data)
     loader  = DataLoader(
         dataset, batch_size=BATCH_SIZE, shuffle=True,
-        num_workers=4 if args.gpu else 0,
+        num_workers=6 if args.gpu else 0,   # i5-12400F 12 çekirdek
         pin_memory=args.gpu,
+        persistent_workers=args.gpu,
     )
 
     secret_loss_fn = nn.BCEWithLogitsLoss()
     total_steps    = args.epochs * len(loader)
     step           = 0
     best_id_acc    = 0.0
+    # Mixed precision — RTX 3060'ta ~1.5x hız artışı
+    scaler = torch.cuda.amp.GradScaler(enabled=args.gpu)
 
     Path(args.out).mkdir(parents=True, exist_ok=True)
 
@@ -143,29 +146,32 @@ def train(args):
             wm_ids = [random.randint(0, 255) for _ in range(B)]
             secret = torch.stack([bits_from_wm_id(wid) for wid in wm_ids]).to(device)
 
-            # Encode
-            residual = encoder(images, secret)
-            encoded  = torch.clamp(images + residual, 0, 1)
+            with torch.cuda.amp.autocast(enabled=args.gpu):
+                # Encode
+                residual = encoder(images, secret)
+                encoded  = torch.clamp(images + residual, 0, 1)
 
-            # Distort (screen→camera simülasyonu)
-            distorted = augment(encoded)
+                # Distort (screen→camera simülasyonu)
+                distorted = augment(encoded)
 
-            # Decode
-            pred_logits = decoder(distorted)
+                # Decode
+                pred_logits = decoder(distorted)
 
-            # Losses
-            img_l  = yuv_loss(encoded, images)
-            edg_l  = edge_loss(residual)
-            sec_l  = secret_loss_fn(pred_logits, secret)
+                # Losses
+                img_l  = yuv_loss(encoded, images)
+                edg_l  = edge_loss(residual)
+                sec_l  = secret_loss_fn(pred_logits, secret)
 
-            # Image loss için ramp: ilk 3K adımda sadece secret loss
-            img_ramp = min(1.0, max(0.0, (step - 3_000) / 5_000))
-            loss = W_SECRET * sec_l + img_ramp * (W_IMAGE * img_l + W_EDGE * edg_l)
+                # Image loss için ramp: ilk 3K adımda sadece secret loss
+                img_ramp = min(1.0, max(0.0, (step - 3_000) / 5_000))
+                loss = W_SECRET * sec_l + img_ramp * (W_IMAGE * img_l + W_EDGE * edg_l)
 
             optimizer.zero_grad()
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(params, 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             epoch_img  += img_l.item()
             epoch_sec  += sec_l.item()
