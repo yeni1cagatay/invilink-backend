@@ -37,16 +37,23 @@ def _blur(img: torch.Tensor, sigma: float) -> torch.Tensor:
 
 
 def _jpeg(img: torch.Tensor, quality: int) -> torch.Tensor:
-    """PIL üzerinden JPEG round-trip (non-differentiable, sadece inference zamanı)."""
-    out = []
-    for i in range(img.size(0)):
-        arr = (img[i].detach().permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-        buf = io.BytesIO()
-        Image.fromarray(arr).save(buf, "JPEG", quality=quality)
-        buf.seek(0)
-        arr2 = np.array(Image.open(buf)).astype(np.float32) / 255.0
-        out.append(torch.from_numpy(arr2).permute(2, 0, 1))
-    return torch.stack(out).to(img.device)
+    """
+    PIL JPEG round-trip. Gradient-friendly: JPEG'i detach ile işle,
+    sonra STE (Straight-Through Estimator) ile farkı orijinale ekle.
+    Encoder böylece JPEG bozulmasına karşı gradient alır.
+    """
+    with torch.no_grad():
+        out = []
+        for i in range(img.size(0)):
+            arr = (img[i].permute(1, 2, 0).cpu().float().numpy() * 255).clip(0, 255).astype(np.uint8)
+            buf = io.BytesIO()
+            Image.fromarray(arr).save(buf, "JPEG", quality=quality)
+            buf.seek(0)
+            arr2 = np.array(Image.open(buf)).astype(np.float32) / 255.0
+            out.append(torch.from_numpy(arr2).permute(2, 0, 1))
+        compressed = torch.stack(out).to(img.device)
+    # STE: forward = compressed, backward = img (gradient akıyor)
+    return img + (compressed - img).detach()
 
 
 # ─── BİREYSEL BOZULMALAR ─────────────────────────────────────────────────────
