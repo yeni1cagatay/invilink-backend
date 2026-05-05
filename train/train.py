@@ -168,11 +168,14 @@ def train(args):
         persistent_workers=False,
     )
 
-    secret_loss_fn = nn.BCEWithLogitsLoss()
-    total_steps    = args.epochs * len(loader)
-    step           = 0
-    best_id_acc    = 0.0
-    start_epoch    = 1
+    secret_loss_fn     = nn.BCEWithLogitsLoss()
+    total_steps        = args.epochs * len(loader)
+    step               = 0
+    best_id_acc        = 0.0
+    start_epoch        = 1
+    id_acc_history: list = []
+    id_acc_drop_streak   = 0
+    MIN_LR               = 1e-6
     # Mixed precision — RTX 3060'ta ~1.5x hız artışı
     scaler = torch.amp.GradScaler('cuda', enabled=args.gpu)
 
@@ -302,6 +305,29 @@ def train(args):
         # id_acc ani düşüş kontrolü
         if epoch > 1 and id_acc < 50.0:
             alert("id_acc Duste", f"Epoch {epoch} | id_acc=%{id_acc:.1f} — model bozulmus olabilir", "KRITIK")
+
+        # ─── id_acc düşüş takibi: LR küçültme + rollback ──────────────────
+        if id_acc_history and id_acc < id_acc_history[-1]:
+            id_acc_drop_streak += 1
+        else:
+            id_acc_drop_streak = 0
+        id_acc_history.append(id_acc)
+
+        if id_acc_drop_streak >= 2:
+            for pg in optimizer.param_groups:
+                pg['lr'] = max(pg['lr'] * 0.5, MIN_LR)
+            cur_lr = optimizer.param_groups[0]['lr']
+            alert("LR Dusuruldu", f"Epoch {epoch} | {id_acc_drop_streak} epoch dusus — LR={cur_lr:.2e}", "UYARI")
+
+        if id_acc_drop_streak >= 3 and best_path.exists():
+            ckpt = torch.load(best_path, map_location=device, weights_only=False)
+            encoder.load_state_dict(ckpt["encoder"])
+            decoder.load_state_dict(ckpt["decoder"])
+            cur_lr    = optimizer.param_groups[0]['lr']
+            optimizer = optim.AdamW(params, lr=cur_lr, weight_decay=1e-4)
+            scaler    = torch.amp.GradScaler('cuda', enabled=args.gpu)
+            id_acc_drop_streak = 0
+            alert("ROLLBACK", f"Epoch {epoch} | Best modele donuldu (epoch {ckpt['epoch']}, %{ckpt['id_acc']:.1f}) — LR={cur_lr:.2e}", "KRITIK")
 
         # Her epoch resume checkpoint kaydet (atomik: temp → rename)
         resume_tmp = Path(args.out) / "brandion_resume.tmp"
