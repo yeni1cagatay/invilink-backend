@@ -42,15 +42,17 @@ def alert(title: str, message: str, level: str = "UYARI"):
     with open(ALERT_LOG, "a", encoding="utf-8") as f:
         f.write(entry + "\n")
     # Windows toast bildirimi
-    ps = (
-        f'[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null;'
-        f'$template = [Windows.UI.Notifications.ToastTemplateType]::ToastText02;'
-        f'$xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent($template);'
-        f'$xml.GetElementsByTagName("text")[0].AppendChild($xml.CreateTextNode("{title}")) | Out-Null;'
-        f'$xml.GetElementsByTagName("text")[1].AppendChild($xml.CreateTextNode("{message}")) | Out-Null;'
-        f'$toast = [Windows.UI.Notifications.ToastNotification]::new($xml);'
-        f'[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("Brandion AI").Show($toast);'
-    )
+    t = title.replace("'", "").replace('"', '')
+    m = message.replace("'", "").replace('"', '')
+    ps = f"""
+Add-Type -AssemblyName System.Windows.Forms
+$n = New-Object System.Windows.Forms.NotifyIcon
+$n.Icon = [System.Drawing.SystemIcons]::Information
+$n.Visible = $true
+$n.ShowBalloonTip(5000, '{t}', '{m}', [System.Windows.Forms.ToolTipIcon]::Info)
+Start-Sleep -Seconds 6
+$n.Dispose()
+"""
     try:
         subprocess.Popen(["powershell", "-WindowStyle", "Hidden", "-Command", ps])
     except Exception:
@@ -172,6 +174,7 @@ def train(args):
     total_steps        = args.epochs * len(loader)
     step               = 0
     best_id_acc        = 0.0
+    best_loss          = float('inf')
     start_epoch        = 1
     id_acc_history: list = []
     id_acc_drop_streak   = 0
@@ -295,12 +298,15 @@ def train(args):
             f"id_acc={id_acc:.1f}% (clean={id_acc_clean:.1f}%)  [{elapsed:.0f}s]"
         )
 
-        is_best = id_acc > best_id_acc
+        cur_loss = epoch_loss / n
+        is_best = id_acc > best_id_acc or (id_acc == 100.0 and cur_loss < best_loss)
         if is_best:
-            best_id_acc = id_acc
+            if id_acc > best_id_acc:
+                best_id_acc = id_acc
+            best_loss = cur_loss
             _save(encoder, decoder, args.out, epoch, id_acc)
-            print(f"  -> saved  (best id_acc={best_id_acc:.1f}%)")
-            alert("Yeni En İyi Model", f"Epoch {epoch} | id_acc=%{id_acc:.1f}", "BILGI")
+            print(f"  -> saved  (best id_acc={best_id_acc:.1f}%  loss={best_loss:.6f})")
+            alert("Yeni En Iyi Model", f"Epoch {epoch} | id_acc=%{id_acc:.1f} loss={cur_loss:.6f}", "BILGI")
 
         # id_acc ani düşüş kontrolü
         if epoch > 1 and id_acc < 50.0:
