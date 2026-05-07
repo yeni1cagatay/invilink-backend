@@ -21,13 +21,13 @@ import numpy as np
 import torch
 
 
-ALERT_LOG    = Path(r"C:\Users\cyeni\train_alerts.log")
-DISK_PATH    = Path(r"C:\Users\cyeni")
-_loss_history: list = []   # son 500 adımın loss'u
-_last_alerts: dict  = {}   # aynı alertin spam yapmaması için
+ALERT_LOG     = Path(r"C:\Users\cyeni\train_alerts.log")
+DISK_PATH     = Path(r"C:\Users\cyeni")
+NTFY_TOPIC    = "brandion-cagatay-2024"   # ntfy.sh kanal adi
+_loss_history: list = []
+_last_alerts: dict  = {}
 
 def _cooldown(key: str, minutes: int = 30) -> bool:
-    """Aynı alert key'i için cooldown süresi geçtiyse True döner."""
     now = time.time()
     if key not in _last_alerts or now - _last_alerts[key] > minutes * 60:
         _last_alerts[key] = now
@@ -35,12 +35,33 @@ def _cooldown(key: str, minutes: int = 30) -> bool:
     return False
 
 def alert(title: str, message: str, level: str = "UYARI"):
-    """Windows toast bildirimi + alert log."""
+    """Alert log + ntfy.sh push + Windows toast."""
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     entry = f"[{ts}] [{level}] {title}: {message}"
     print(entry, flush=True)
     with open(ALERT_LOG, "a", encoding="utf-8") as f:
         f.write(entry + "\n")
+
+    # ntfy.sh push bildirimi (telefona gider)
+    priority = {"KRITIK": "urgent", "UYARI": "high", "BILGI": "default"}.get(level, "default")
+    tags     = {"KRITIK": "rotating_light", "UYARI": "warning", "BILGI": "white_check_mark"}.get(level, "bell")
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"https://ntfy.sh/{NTFY_TOPIC}",
+            data=message.encode("utf-8"),
+            headers={
+                "Title":    title,
+                "Priority": priority,
+                "Tags":     tags,
+                "X-Level":  level,
+            },
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass
+
     # Windows toast bildirimi
     t = title.replace("'", "").replace('"', '')
     m = message.replace("'", "").replace('"', '')
@@ -262,7 +283,13 @@ def train(args):
                 loss = W_SECRET * sec_l + img_ramp * (W_IMAGE * img_l + W_EDGE * edg_l) + anti_collapse
 
             if torch.isnan(loss) or torch.isinf(loss):
-                alert("NaN Loss Tespit Edildi", f"Epoch {epoch}, step {step} — adim atlandi", "KRITIK")
+                alert(
+                    "NaN/Inf Loss Tespit Edildi",
+                    f"Epoch {epoch}/{args.epochs} | Step {step} | "
+                    f"Loss degeri gecersiz (NaN/Inf) — bu adim atlandi, egitim devam ediyor. "
+                    f"Arka arkaya cok fazla NaN gorulurse egitim bozulabilir.",
+                    "KRITIK"
+                )
                 continue
 
             optimizer.zero_grad()
@@ -306,11 +333,21 @@ def train(args):
             best_loss = cur_loss
             _save(encoder, decoder, args.out, epoch, id_acc)
             print(f"  -> saved  (best id_acc={best_id_acc:.1f}%  loss={best_loss:.6f})")
-            alert("Yeni En Iyi Model", f"Epoch {epoch} | id_acc=%{id_acc:.1f} loss={cur_loss:.6f}", "BILGI")
+            alert(
+                "Yeni En Iyi Model Kaydedildi",
+                f"Epoch {epoch}/{args.epochs} | id_acc=%{id_acc:.1f} | "
+                f"loss={cur_loss:.6f} | Checkpoint guncellendi.",
+                "BILGI"
+            )
 
         # id_acc ani düşüş kontrolü
         if epoch > 1 and id_acc < 50.0:
-            alert("id_acc Duste", f"Epoch {epoch} | id_acc=%{id_acc:.1f} — model bozulmus olabilir", "KRITIK")
+            alert(
+                "id_acc Kritik Dusus",
+                f"Epoch {epoch}/{args.epochs} | id_acc=%{id_acc:.1f} (esik: %50) | "
+                f"Model bozulmus olabilir — mudahale gerekebilir!",
+                "KRITIK"
+            )
 
         # ─── id_acc düşüş takibi: LR küçültme + rollback ──────────────────
         if id_acc_history and id_acc < id_acc_history[-1]:
@@ -323,7 +360,13 @@ def train(args):
             for pg in optimizer.param_groups:
                 pg['lr'] = max(pg['lr'] * 0.5, MIN_LR)
             cur_lr = optimizer.param_groups[0]['lr']
-            alert("LR Dusuruldu", f"Epoch {epoch} | {id_acc_drop_streak} epoch dusus — LR={cur_lr:.2e}", "UYARI")
+            alert(
+                "Ogrenme Hizi Dusuruldu",
+                f"Epoch {epoch}/{args.epochs} | id_acc {id_acc_drop_streak} epoch ust uste dustü "
+                f"(%{id_acc_history[-2]:.1f} → %{id_acc:.1f}) | "
+                f"LR otomatik %50 azaltıldı: {cur_lr:.2e}",
+                "UYARI"
+            )
 
         if id_acc_drop_streak >= 3 and best_path.exists():
             ckpt = torch.load(best_path, map_location=device, weights_only=False)
@@ -333,7 +376,13 @@ def train(args):
             optimizer = optim.AdamW(params, lr=cur_lr, weight_decay=1e-4)
             scaler    = torch.amp.GradScaler('cuda', enabled=args.gpu)
             id_acc_drop_streak = 0
-            alert("ROLLBACK", f"Epoch {epoch} | Best modele donuldu (epoch {ckpt['epoch']}, %{ckpt['id_acc']:.1f}) — LR={cur_lr:.2e}", "KRITIK")
+            alert(
+                "Otomatik Rollback Yapildi",
+                f"Epoch {epoch}/{args.epochs} | id_acc 3 epoch ust uste dustu | "
+                f"En iyi checkpoint yuklendi (epoch {ckpt['epoch']}, id_acc=%{ckpt['id_acc']:.1f}) | "
+                f"LR sifirlandı: {cur_lr:.2e} | Egitim devam ediyor.",
+                "KRITIK"
+            )
 
         # Her epoch resume checkpoint kaydet (atomik: temp → rename)
         resume_tmp = Path(args.out) / "brandion_resume.tmp"
@@ -423,27 +472,53 @@ def _step_checks(epoch: int, step: int, loss_val: float):
     if len(_loss_history) > 500:
         _loss_history.pop(0)
     if len(_loss_history) >= 200 and _cooldown("loss_trend", 60):
-        recent = _loss_history[-100:]
-        older  = _loss_history[-200:-100]
-        if sum(recent) / len(recent) > sum(older) / len(older) * 2.0:
-            alert("Loss Artıyor", f"Epoch {epoch} step {step} — son 100 adim 2x daha yuksek", "UYARI")
+        recent     = _loss_history[-100:]
+        older      = _loss_history[-200:-100]
+        avg_recent = sum(recent) / len(recent)
+        avg_older  = sum(older)  / len(older)
+        if avg_recent > avg_older * 2.0 and avg_older > 0:
+            ratio = avg_recent / avg_older
+            alert(
+                "Loss Trend Uyarisi",
+                f"Epoch {epoch} | Step {step} | Son 100 adim ortalaması {ratio:.1f}x yukseldi "
+                f"(onceki: {avg_older:.5f} → simdi: {avg_recent:.5f}). "
+                f"id_acc etkilenmiyorsa augmentation kaynaklı geçici spike olabilir.",
+                "UYARI"
+            )
 
     # 2. GPU sıcaklık ve VRAM
     if _cooldown("gpu_temp", 10):
         try:
             out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=temperature.gpu,memory.used,memory.total",
+                ["nvidia-smi", "--query-gpu=temperature.gpu,memory.used,memory.total,utilization.gpu",
                  "--format=csv,noheader"], text=True).strip().split(",")
             temp     = int(out[0].strip())
             mem_used = int(out[1].strip().replace(" MiB", ""))
             mem_tot  = int(out[2].strip().replace(" MiB", ""))
+            gpu_util = out[3].strip().replace(" %", "")
             mem_pct  = mem_used / mem_tot * 100
             if temp >= 85:
-                alert("GPU COK SICAK", f"{temp}C — termal throttle riski!", "KRITIK")
+                alert(
+                    "GPU Asiri Isinma",
+                    f"Epoch {epoch} | Sicaklik: {temp}C (esik: 85C) | "
+                    f"VRAM: {mem_used}/{mem_tot} MB (%{mem_pct:.0f}) | GPU: %{gpu_util} | "
+                    f"Termal throttle veya donanim hasari riski — sogutmayı kontrol et!",
+                    "KRITIK"
+                )
             elif temp >= 78 and _cooldown("gpu_warn", 30):
-                alert("GPU Isinıyor", f"{temp}C", "UYARI")
+                alert(
+                    "GPU Isinıyor",
+                    f"Epoch {epoch} | Sicaklik: {temp}C (esik: 78C) | "
+                    f"VRAM: {mem_used}/{mem_tot} MB (%{mem_pct:.0f}) | Takipte kal.",
+                    "UYARI"
+                )
             if mem_pct >= 95:
-                alert("VRAM DOLUYOR", f"%{mem_pct:.0f} — OOM riski!", "KRITIK")
+                alert(
+                    "VRAM Kritik Seviye",
+                    f"Epoch {epoch} | VRAM: {mem_used}/{mem_tot} MB (%{mem_pct:.0f}) | "
+                    f"Esik: %95 | OOM (Out of Memory) crash riski yuksek!",
+                    "KRITIK"
+                )
         except Exception:
             pass
 
@@ -453,9 +528,19 @@ def _step_checks(epoch: int, step: int, loss_val: float):
             import shutil
             free_gb = shutil.disk_usage(r"C:\Users\cyeni").free / 1e9
             if free_gb < 5:
-                alert("DISK KRITIK", f"Yalnizca {free_gb:.1f} GB kaldi — checkpoint kaydedilemez!", "KRITIK")
+                alert(
+                    "Disk Alani Kritik",
+                    f"Epoch {epoch} | Bos alan: {free_gb:.1f} GB | "
+                    f"Checkpoint kaydedilemeyebilir — hemen yer ac!",
+                    "KRITIK"
+                )
             elif free_gb < 15:
-                alert("Disk Azaliyor", f"{free_gb:.1f} GB kaldi", "UYARI")
+                alert(
+                    "Disk Alani Azaliyor",
+                    f"Epoch {epoch} | Bos alan: {free_gb:.1f} GB kaldi (esik: 15 GB) | "
+                    f"Yakin zamanda kritik seviyeye duşebilir.",
+                    "UYARI"
+                )
         except Exception:
             pass
 
